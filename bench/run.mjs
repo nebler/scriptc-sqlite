@@ -84,6 +84,7 @@ function median(xs) {
 // ── implementations ──────────────────────────────────────────────────────
 const tsBench = join(root, "bench", "sqlite-bench.mts");
 const scriptcExe = join(work, "scriptc-bench");
+const gooseExe = join(work, "goose-bench");
 const goExe = join(work, "go-bench");
 const rustTarget = join(work, "rust-target");
 const rustExe = join(rustTarget, "release", "rust-bench");
@@ -171,6 +172,19 @@ const impls = [
     command: (w, db, n) => [goExe, [w, db, String(n)], {}],
     version: () => firstLine(run("go", ["version"]).stdout),
     size: () => ({ bytes: fileSize(goExe), stripped: null, what: "program" }),
+  },
+  {
+    id: "goose",
+    label: "Goose",
+    available: () => found("goose"),
+    missing: "goose",
+    build() {
+      const r = run(process.execPath, [join(root, "bench", "goose", "build.mjs"), gooseExe], { cwd: root });
+      return r.status === 0 ? null : `goose build failed:\n${(r.stdout + r.stderr).slice(-4000)}`;
+    },
+    command: (w, db, n) => [gooseExe, [w, db, String(n)], {}],
+    version: () => firstLine(run("goose", ["--version"]).stdout),
+    size: () => ({ bytes: fileSize(gooseExe), stripped: null, what: "program" }),
   },
   {
     id: "rust",

@@ -52,6 +52,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.91.1
+      - name: Cache Goose compiler
+        id: goose-cache
+        uses: actions/cache@v4
+        with:
+          path: build/bench/goose-toolchain
+          key: goose-${{ runner.os }}-${{ runner.arch }}-4602c98660676b2cb94bc9b06fec8c65b37fce92-v1
+      - name: Build Goose compiler
+        if: steps.goose-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/aardappel/goose.git build/bench/goose-toolchain/src
+          git -C build/bench/goose-toolchain/src checkout --detach 4602c98660676b2cb94bc9b06fec8c65b37fce92
+          git -C build/bench/goose-toolchain/src submodule update --init --recursive
+          cmake -S build/bench/goose-toolchain/src -B build/bench/goose-toolchain/compiler -DCMAKE_BUILD_TYPE=Release -DGOOSE_BUILTIN_LIBS=none
+          cmake --build build/bench/goose-toolchain/compiler --parallel 3
+      - name: Add Goose to PATH
+        run: echo "$GITHUB_WORKSPACE/build/bench/goose-toolchain/compiler" >> "$GITHUB_PATH"
       - name: Install scriptc
         run: npm ci --no-audit --no-fund
       - name: Check that every implementation agrees
