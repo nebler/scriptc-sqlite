@@ -8,10 +8,12 @@
  * small ("length first, then copy").
  *
  * Handles (sqlite3 *, sqlite3_stmt *) cross as opaque pointers. Nothing here
- * keeps state between calls, so connections and statements may live on any
- * scriptc thread, one thread at a time each. */
+ * keeps state between calls except thread-local values (the last prepare
+ * code, the user-function dispatcher), so connections and statements may
+ * live on any scriptc thread, one thread at a time each. */
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include "sqlite3.h"
 
@@ -23,6 +25,15 @@ static int64_t copy_out(const void *src, size_t len, uint8_t *out, size_t cap) {
 /* The FFI hands over a span (pointer, length) without a terminating NUL, and
  * an empty span may come with a null pointer. */
 static const char *nonnull(const uint8_t *p) { return p ? (const char *)p : ""; }
+
+/* The span as a NUL-terminated copy (sqlite3_free it), or NULL. */
+static char *span_dup(const uint8_t *p, size_t n) {
+  char *s = sqlite3_malloc64(n + 1);
+  if (!s) return NULL;
+  if (n) memcpy(s, p, n);
+  s[n] = 0;
+  return s;
+}
 
 /* ── connections ─────────────────────────────────────────────────────── */
 
@@ -215,6 +226,327 @@ int64_t sqx_column_blob(void *stmt, int32_t i, uint8_t *out, size_t cap) {
   const void *b = sqlite3_column_blob((sqlite3_stmt *)stmt, i);
   size_t n = (size_t)sqlite3_column_bytes((sqlite3_stmt *)stmt, i);
   return b ? copy_out(b, n, out, cap) : 0;
+}
+
+/* ── serialize, deserialize, location, backup ────────────────────────── */
+
+/* sqlite3_serialize makes a fresh copy each time, so this serializes once
+ * and keeps the copy (thread-local) until sqx_serialized_take copies it
+ * out and frees it. Returns the size, or -1 when SQLite failed (read the
+ * error from the connection). `name` is the schema ("main"). */
+static _Thread_local unsigned char *serialized;
+static _Thread_local sqlite3_int64 serialized_size;
+
+int64_t sqx_serialize(void *db, const uint8_t *name, size_t name_len) {
+  char *schema = span_dup(name, name_len);
+  if (!schema) return -1;
+  if (serialized) sqlite3_free(serialized);
+  serialized_size = 0;
+  serialized = sqlite3_serialize((sqlite3 *)db, schema, &serialized_size, 0);
+  sqlite3_free(schema);
+  if (!serialized) return serialized_size > 0 ? -1 : 0;
+  return (int64_t)serialized_size;
+}
+
+void sqx_serialized_take(uint8_t *out, size_t cap) {
+  if (serialized && (size_t)serialized_size <= cap) memcpy(out, serialized, (size_t)serialized_size);
+  sqlite3_free(serialized);
+  serialized = NULL;
+  serialized_size = 0;
+}
+
+/* Replaces schema `name` with a copy of the bytes, which SQLite owns and
+ * may grow (as Node does). */
+int32_t sqx_deserialize(void *db, const uint8_t *name, size_t name_len, const uint8_t *p, size_t n) {
+  char *schema = span_dup(name, name_len);
+  if (!schema) return SQLITE_NOMEM;
+  unsigned char *copy = sqlite3_malloc64(n);
+  if (!copy) {
+    sqlite3_free(schema);
+    return SQLITE_NOMEM;
+  }
+  memcpy(copy, p, n);
+  int rc = sqlite3_deserialize((sqlite3 *)db, schema, copy, (sqlite3_int64)n, (sqlite3_int64)n,
+                               SQLITE_DESERIALIZE_FREEONCLOSE | SQLITE_DESERIALIZE_RESIZEABLE);
+  sqlite3_free(schema);
+  return rc;
+}
+
+/* The file behind schema `name`; -1 for none (in-memory, temporary). */
+int64_t sqx_db_filename(void *db, const uint8_t *name, size_t name_len, uint8_t *out, size_t cap) {
+  char *schema = span_dup(name, name_len);
+  if (!schema) return -1;
+  const char *f = sqlite3_db_filename((sqlite3 *)db, schema);
+  sqlite3_free(schema);
+  if (!f || !f[0]) return -1;
+  return copy_out(f, strlen(f), out, cap);
+}
+
+/* An online backup into a new connection to `path`. The handle holds both;
+ * sqx_backup_finish closes them. Errors are the destination's, as in
+ * Node. */
+struct sqx_backup {
+  sqlite3 *dest;
+  sqlite3_backup *backup;
+};
+
+void *sqx_backup_open(void *src, const uint8_t *path, size_t path_len, const uint8_t *src_name, size_t src_len,
+                      const uint8_t *dest_name, size_t dest_len) {
+  struct sqx_backup *b = sqlite3_malloc(sizeof *b);
+  if (!b) return NULL;
+  b->dest = NULL;
+  b->backup = NULL;
+  char *file = span_dup(path, path_len), *from = span_dup(src_name, src_len), *to = span_dup(dest_name, dest_len);
+  if (file && from && to) {
+    if (sqlite3_open_v2(file, &b->dest, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) ==
+        SQLITE_OK)
+      b->backup = sqlite3_backup_init(b->dest, to, (sqlite3 *)src, from);
+  }
+  sqlite3_free(file);
+  sqlite3_free(from);
+  sqlite3_free(to);
+  return b;
+}
+
+/* 1 when the backup started; else read the error with sqx_backup_errcode
+ * and sqx_backup_errmsg. */
+int32_t sqx_backup_ok(void *p) { return ((struct sqx_backup *)p)->backup != NULL; }
+
+int32_t sqx_backup_step(void *p, int32_t pages) { return sqlite3_backup_step(((struct sqx_backup *)p)->backup, pages); }
+int32_t sqx_backup_total(void *p) { return sqlite3_backup_pagecount(((struct sqx_backup *)p)->backup); }
+int32_t sqx_backup_remaining(void *p) { return sqlite3_backup_remaining(((struct sqx_backup *)p)->backup); }
+
+int32_t sqx_backup_errcode(void *p) {
+  struct sqx_backup *b = p;
+  return b->dest ? sqlite3_extended_errcode(b->dest) : SQLITE_NOMEM;
+}
+
+int64_t sqx_backup_errmsg(void *p, uint8_t *out, size_t cap) {
+  struct sqx_backup *b = p;
+  const char *m = b->dest ? sqlite3_errmsg(b->dest) : sqlite3_errstr(SQLITE_NOMEM);
+  return copy_out(m, strlen(m), out, cap);
+}
+
+void sqx_backup_finish(void *p) {
+  struct sqx_backup *b = p;
+  if (b->backup) sqlite3_backup_finish(b->backup);
+  if (b->dest) sqlite3_close_v2(b->dest);
+  sqlite3_free(b);
+}
+
+/* ── packed rows ─────────────────────────────────────────────────────── */
+
+/* A whole row in one call, instead of one or two calls per value. Each
+ * column is a type byte (SQLITE_INTEGER 1, FLOAT 2, TEXT 3, BLOB 4, NULL 5)
+ * followed by 8 bytes for an integer (int64) or a float (IEEE double), or
+ * 4 bytes of length and the bytes for text and blobs. Numbers are written
+ * little-endian whatever the machine.
+ *
+ * Returns the packed length (copied only if it fits in cap); the caller
+ * asks again with sqx_row and a bigger buffer when it did not fit. */
+static void put64(uint8_t *p, uint64_t v) {
+  for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+int64_t sqx_row(void *stmt, uint8_t *out, size_t cap) {
+  sqlite3_stmt *s = (sqlite3_stmt *)stmt;
+  int count = sqlite3_column_count(s);
+  size_t need = 0;
+  for (int i = 0; i < count; i++) {
+    int type = sqlite3_column_type(s, i);
+    if (type == SQLITE_INTEGER || type == SQLITE_FLOAT) need += 9;
+    else if (type == SQLITE_TEXT) {
+      sqlite3_column_text(s, i); /* converts to UTF-8 first, then measure */
+      need += 5 + (size_t)sqlite3_column_bytes(s, i);
+    } else if (type == SQLITE_BLOB) need += 5 + (size_t)sqlite3_column_bytes(s, i);
+    else need += 1;
+  }
+  if (need > cap) return (int64_t)need;
+  uint8_t *p = out;
+  for (int i = 0; i < count; i++) {
+    int type = sqlite3_column_type(s, i);
+    *p++ = (uint8_t)type;
+    if (type == SQLITE_INTEGER) {
+      put64(p, (uint64_t)sqlite3_column_int64(s, i));
+      p += 8;
+    } else if (type == SQLITE_FLOAT) {
+      double d = sqlite3_column_double(s, i);
+      uint64_t bits;
+      memcpy(&bits, &d, 8);
+      put64(p, bits);
+      p += 8;
+    } else if (type == SQLITE_TEXT || type == SQLITE_BLOB) {
+      const void *v = type == SQLITE_TEXT ? (const void *)sqlite3_column_text(s, i) : sqlite3_column_blob(s, i);
+      uint32_t n = (uint32_t)sqlite3_column_bytes(s, i);
+      for (int k = 0; k < 4; k++) p[k] = (uint8_t)(n >> (8 * k));
+      p += 4;
+      if (n > 0 && v) memcpy(p, v, n);
+      p += n;
+    }
+  }
+  return (int64_t)need;
+}
+
+/* An environment variable's value (copied as usual), or -1 when unset. */
+int64_t sqx_getenv(const uint8_t *name, size_t name_len, uint8_t *out, size_t cap) {
+  char *n = span_dup(name, name_len);
+  if (!n) return -1;
+  const char *v = getenv(n);
+  sqlite3_free(n);
+  return v ? copy_out(v, strlen(v), out, cap) : -1;
+}
+
+/* 1 when SCRIPTC_SQLITE_ROW_READS=columns asks for the per-value read
+ * path. Read here, not through process.env: in scriptc 0.4.12, touching
+ * process.env costs about 10 MiB of memory per thread. */
+int32_t sqx_columns_mode(void) {
+  const char *v = getenv("SCRIPTC_SQLITE_ROW_READS");
+  return v && strcmp(v, "columns") == 0;
+}
+
+/* Steps; on a row, packs it as sqx_row does and returns its length (>= 0).
+ * Otherwise returns -1 - rc: -102 for SQLITE_DONE, -2 for SQLITE_ERROR. */
+int64_t sqx_step_row(void *stmt, uint8_t *out, size_t cap) {
+  int rc = sqlite3_step((sqlite3_stmt *)stmt);
+  if (rc != SQLITE_ROW) return -1 - (int64_t)rc;
+  return sqx_row(stmt, out, cap);
+}
+
+/* ── user-defined functions ──────────────────────────────────────────── */
+
+/* SQLite keeps a function's callbacks long after the call that registers
+ * it, so TypeScript registers one retained dispatcher per thread (a scriptc
+ * FFI callback with a context pointer) and every function SQLite calls goes
+ * through it: `op` says which callback this is, `id` which function (the
+ * user-data pointer given at registration), and TypeScript reads the
+ * arguments and sets the result with the sqx_value_* and sqx_result_*
+ * functions below. SQLite calls a function on the thread that steps the
+ * statement, so the dispatcher is thread-local, like everything else here.
+ *
+ * The dispatcher returns 1 when it set a result. Anything else means a
+ * TypeScript exception is waiting on that side; the function then fails
+ * with an empty error message, which TypeScript replaces with that
+ * exception (as Node does). A dispatcher that throws is seen here as 0. */
+enum { SQX_FUNC = 0, SQX_STEP = 1, SQX_INVERSE = 2, SQX_VALUE = 3, SQX_FINAL = 4, SQX_DESTROY = 5 };
+typedef int32_t (*sqx_dispatch_fn)(int32_t op, int64_t id, void *ctx, int32_t argc, void *argv, void *user);
+static _Thread_local sqx_dispatch_fn dispatch_fn;
+static _Thread_local void *dispatch_user;
+
+void sqx_set_dispatch(sqx_dispatch_fn fn, void *user) {
+  dispatch_fn = fn;
+  dispatch_user = user;
+}
+
+static void call_dispatch(int op, sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  int64_t id = (int64_t)(intptr_t)sqlite3_user_data(ctx);
+  if (!dispatch_fn) {
+    sqlite3_result_error(ctx, "user-defined function called on a thread that did not define it", -1);
+    return;
+  }
+  if (dispatch_fn(op, id, ctx, argc, argv, dispatch_user) != 1) sqlite3_result_error(ctx, "", 0);
+}
+
+static void x_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) { call_dispatch(SQX_FUNC, ctx, argc, argv); }
+static void x_step(sqlite3_context *ctx, int argc, sqlite3_value **argv) { call_dispatch(SQX_STEP, ctx, argc, argv); }
+static void x_inverse(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  call_dispatch(SQX_INVERSE, ctx, argc, argv);
+}
+static void x_value(sqlite3_context *ctx) { call_dispatch(SQX_VALUE, ctx, 0, NULL); }
+static void x_final(sqlite3_context *ctx) { call_dispatch(SQX_FINAL, ctx, 0, NULL); }
+
+/* SQLite drops a function when it is replaced or the connection closes;
+ * TypeScript then forgets it. Only ever on the thread that uses it. */
+static void x_destroy(void *p) {
+  if (dispatch_fn) dispatch_fn(SQX_DESTROY, (int64_t)(intptr_t)p, NULL, 0, NULL, dispatch_user);
+}
+
+/* `name` is a UTF-8 span. `flags` holds SQLITE_DETERMINISTIC and
+ * SQLITE_DIRECTONLY as TypeScript computed them; SQLITE_UTF8 is added here.
+ * As SQLite does when registering fails, x_destroy runs if the name cannot
+ * be copied, so TypeScript forgets the function either way. */
+int32_t sqx_create_function(void *db, const uint8_t *name, size_t name_len, int32_t argc, int32_t flags,
+                            int64_t id) {
+  char *fname = span_dup(name, name_len);
+  if (!fname) {
+    x_destroy((void *)(intptr_t)id);
+    return SQLITE_NOMEM;
+  }
+  int rc = sqlite3_create_function_v2((sqlite3 *)db, fname, argc, SQLITE_UTF8 | flags, (void *)(intptr_t)id, x_func,
+                                      NULL, NULL, x_destroy);
+  sqlite3_free(fname);
+  return rc;
+}
+
+/* `window` (an aggregate with an inverse) registers xValue and xInverse. */
+int32_t sqx_create_aggregate(void *db, const uint8_t *name, size_t name_len, int32_t argc, int32_t flags, int64_t id,
+                             int32_t window) {
+  char *fname = span_dup(name, name_len);
+  if (!fname) {
+    x_destroy((void *)(intptr_t)id);
+    return SQLITE_NOMEM;
+  }
+  int rc = sqlite3_create_window_function((sqlite3 *)db, fname, argc, SQLITE_UTF8 | flags, (void *)(intptr_t)id,
+                                          x_step, x_final, window ? x_value : NULL, window ? x_inverse : NULL,
+                                          x_destroy);
+  sqlite3_free(fname);
+  return rc;
+}
+
+/* An aggregate's per-group slot: a number TypeScript chooses to find the
+ * group's state, kept in SQLite's aggregate context. 0 until set; -1 when
+ * SQLite could not allocate the context. */
+int64_t sqx_agg_slot(void *ctx) {
+  int64_t *slot = sqlite3_aggregate_context((sqlite3_context *)ctx, (int)sizeof(int64_t));
+  return slot ? *slot : -1;
+}
+
+void sqx_agg_set_slot(void *ctx, int64_t value) {
+  int64_t *slot = sqlite3_aggregate_context((sqlite3_context *)ctx, (int)sizeof(int64_t));
+  if (slot) *slot = value;
+}
+
+/* Arguments: argv is SQLite's sqlite3_value ** array; i is checked by
+ * TypeScript against argc. Text and blobs as for columns: full length
+ * returned, at most cap bytes copied; the value stays put while the
+ * function runs. */
+static sqlite3_value *arg(void *argv, int32_t i) { return ((sqlite3_value **)argv)[i]; }
+
+int32_t sqx_value_type(void *argv, int32_t i) { return sqlite3_value_type(arg(argv, i)); }
+int64_t sqx_value_int64(void *argv, int32_t i) { return sqlite3_value_int64(arg(argv, i)); }
+double sqx_value_double(void *argv, int32_t i) { return sqlite3_value_double(arg(argv, i)); }
+
+int64_t sqx_value_text(void *argv, int32_t i, uint8_t *out, size_t cap) {
+  const unsigned char *t = sqlite3_value_text(arg(argv, i));
+  size_t n = (size_t)sqlite3_value_bytes(arg(argv, i));
+  return t ? copy_out(t, n, out, cap) : 0;
+}
+
+int64_t sqx_value_blob(void *argv, int32_t i, uint8_t *out, size_t cap) {
+  const void *b = sqlite3_value_blob(arg(argv, i));
+  size_t n = (size_t)sqlite3_value_bytes(arg(argv, i));
+  return b ? copy_out(b, n, out, cap) : 0;
+}
+
+/* Results. As with binding, empty text and blobs are set explicitly, since
+ * an empty span may arrive as a null pointer, which SQLite takes as NULL. */
+void sqx_result_null(void *ctx) { sqlite3_result_null((sqlite3_context *)ctx); }
+void sqx_result_double(void *ctx, double v) { sqlite3_result_double((sqlite3_context *)ctx, v); }
+void sqx_result_int64(void *ctx, int64_t v) { sqlite3_result_int64((sqlite3_context *)ctx, v); }
+
+void sqx_result_text(void *ctx, const uint8_t *p, size_t n) {
+  sqlite3_result_text64((sqlite3_context *)ctx, nonnull(p), (sqlite3_uint64)n, SQLITE_TRANSIENT, SQLITE_UTF8);
+}
+
+void sqx_result_blob(void *ctx, const uint8_t *p, size_t n) {
+  if (n == 0) {
+    sqlite3_result_zeroblob((sqlite3_context *)ctx, 0);
+    return;
+  }
+  sqlite3_result_blob64((sqlite3_context *)ctx, p, (sqlite3_uint64)n, SQLITE_TRANSIENT);
+}
+
+void sqx_result_error(void *ctx, const uint8_t *p, size_t n) {
+  sqlite3_result_error((sqlite3_context *)ctx, nonnull(p), (int)n);
 }
 
 /* The SQLite library version, for the notes. */

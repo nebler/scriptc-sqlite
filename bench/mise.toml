@@ -1,0 +1,7 @@
+# Toolchains for the benchmark's other implementations (bench/README.md).
+# Not in the root mise.toml, which every sandbox start installs.
+[tools]
+bun = "1.3"
+deno = "2"
+go = "1.25"
+rust = "1.91"

@@ -1,0 +1,12 @@
+{
+  "name": "marks",
+  "private": true,
+  "type": "module",
+  "description": "A bookmarks command-line tool: scriptc-sqlite's demo, one small executable with SQLite inside",
+  "scripts": {
+    "build": "scriptc-sqlite build marks.ts -o build/marks"
+  },
+  "dependencies": {
+    "scriptc-sqlite": "file:.."
+  }
+}

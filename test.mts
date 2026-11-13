@@ -2,7 +2,8 @@
 // as a scriptc binary (where it is ./src/sqlite.ts). run.sh compares the two
 // outputs byte for byte. Every value is printed through show(), so the
 // output does not depend on how either runtime formats objects.
-import { DatabaseSync } from "#sqlite";
+import { DatabaseSync, backup } from "#sqlite";
+import { mkdirSync, rmSync } from "node:fs";
 
 type Value = null | number | bigint | string | Uint8Array | undefined;
 
@@ -457,6 +458,491 @@ attempt("commit without begin", () => {
       a.close();
     }
   });
+  d.close();
+}
+
+// ── day 3: user-defined functions and aggregates ─────────────────────────
+// Functions written without parameter types, as most Node code writes them,
+// get `SQLOutputValue | undefined` parameters here; functions with typed or
+// rest parameters take the module's second signature.
+{
+  const f = new DatabaseSync(":memory:");
+  const row = (sql: string, ...params: (null | number | bigint | string | Uint8Array)[]): string =>
+    showRow(f.prepare(sql).get(...params) as Record<string, Value>);
+  const rowsOf = (sql: string): string =>
+    f
+      .prepare(sql)
+      .all()
+      .map((r) => showRow(r as Record<string, Value>))
+      .join(" ");
+
+  // Arguments and results of every type.
+  f.function("plus", (a, b) => (a as number) + (b as number));
+  f.function("echo", (a) => a ?? null);
+  f.function("echoBig", { useBigIntArguments: true }, (a) => a ?? null);
+  f.function("kind", (a) => (a === null ? "null" : a instanceof Uint8Array ? "blob" : typeof a));
+  attempt("udf plus", () => row("select plus(2, 3) r, typeof(plus(2, 3)) t"));
+  attempt("udf plus, wrong argument count", () => row("select plus(1) r"));
+  const inputs: [string, null | number | bigint | string | Uint8Array][] = [
+    ["integer", 42n],
+    ["integer as a number", 42],
+    ["negative", -7n],
+    ["real", 2.5],
+    ["text", "héllo 🙂 👩🏽‍💻"],
+    ["empty text", ""],
+    ["text with NUL", "a\u0000b"],
+    ["blob", allBytes],
+    ["empty blob", new Uint8Array(0)],
+    ["null", null],
+    ["2^53+1", 9007199254740993n],
+    ["2^63-1", 9223372036854775807n],
+    ["long text", longText],
+    ["1 MiB blob", bigBlob],
+  ];
+  const bigRow = (sql: string, ...params: (null | number | bigint | string | Uint8Array)[]): string => {
+    const s = f.prepare(sql);
+    s.setReadBigInts(true);
+    return showRow(s.get(...params) as Record<string, Value>);
+  };
+  for (const [label, value] of inputs) {
+    attempt(`udf echo ${label}`, () => row("select echo(?) v, typeof(echo(?)) t, kind(?) k", value, value, value));
+    attempt(`udf echoBig ${label}`, () => bigRow("select echoBig(?) v, typeof(echoBig(?)) t", value, value));
+  }
+
+  // Results Node turns into values, NULL or errors.
+  f.function("retUndefined", () => {});
+  f.function("retNaN", () => NaN);
+  f.function("retNegZero", () => -0);
+  f.function("retInf", () => -Infinity);
+  f.function("retBool", () => true);
+  f.function("retBigMax", () => 9223372036854775807n);
+  f.function("retBigTooLarge", () => 9223372036854775808n);
+  f.function("retBigTooSmall", () => -9223372036854775809n);
+  f.function("retEmptyBlob", () => new Uint8Array(0));
+  f.function("retEmptyText", () => "");
+  for (const name of ["retUndefined", "retNaN", "retNegZero", "retInf", "retBool", "retBigMax", "retBigTooLarge",
+    "retBigTooSmall", "retEmptyBlob", "retEmptyText"]) {
+    attempt(`udf ${name}`, () => {
+      const s = f.prepare(`select ${name}() v, typeof(${name}()) t`);
+      s.setReadBigInts(true);
+      return showRow(s.get() as Record<string, Value>);
+    });
+  }
+
+  // varargs, and a function with fixed parameters called with fewer.
+  f.function("countArgs", { varargs: true }, (...xs: Value[]) => xs.length);
+  f.function("firstOr", { varargs: true }, (a, b) => (a === undefined ? "none" : b === undefined ? "one" : "two"));
+  attempt("udf varargs", () => row("select countArgs() a, countArgs(1) b, countArgs(1, 'x', null, 2.5, x'00') c"));
+  attempt("udf varargs, fixed parameters", () => row("select firstOr() a, firstOr(1) b, firstOr(1, 2) c, firstOr(1, 2, 3) d"));
+  f.function("countArgs2", (...xs: Value[]) => xs.length);
+  attempt("udf rest parameters without varargs", () => row("select countArgs2() a"));
+  attempt("udf rest parameters without varargs, one argument", () => row("select countArgs2(1) a"));
+
+  // Same name: a new definition replaces the old one with the same number
+  // of arguments; another number of arguments is a separate function.
+  f.function("ver", () => "first");
+  f.function("ver", () => "second");
+  f.function("ver", (a) => `one argument: ${a}`);
+  attempt("udf replaced", () => row("select ver() a, ver(1) b"));
+
+  // deterministic: needed in generated columns and indexes.
+  let doubled = 0;
+  f.function("dbl", (a) => {
+    doubled++;
+    return (a as number) * 2;
+  });
+  attempt("udf generated column, not deterministic", () => {
+    f.exec("create table g0 (x integer, y as (dbl(x)))");
+    return "created";
+  });
+  attempt("udf index, not deterministic", () => {
+    f.exec("create table i0 (x integer); create index i0_dbl on i0 (dbl(x))");
+    return "created";
+  });
+  f.function("dbl", { deterministic: true }, (a) => {
+    doubled++;
+    return (a as number) * 2;
+  });
+  attempt("udf generated columns and index, deterministic", () => {
+    f.exec(`
+      create table g (x integer, y real as (dbl(x)) stored, z as (dbl(x) + 1) virtual);
+      create index g_dbl on g (dbl(x));
+    `);
+    const add1 = f.prepare("insert into g (x) values (?)");
+    for (let i = 1; i <= 5; i++) add1.run(i);
+    return `${rowsOf("select x, y, z from g order by x")} | via index ${row(
+      "select x from g indexed by g_dbl where dbl(x) = 8",
+    )} | called ${doubled > 0 ? "yes" : "no"}`;
+  });
+  attempt("udf generated column after update", () => {
+    f.exec("update g set x = x * 10 where x = 2");
+    return rowsOf("select x, y, z from g where x = 20");
+  });
+
+  // directOnly: not allowed in views, triggers, generated columns, indexes.
+  f.function("secret", { directOnly: true, deterministic: true }, () => "s3cret");
+  attempt("udf directOnly, direct", () => row("select secret() s"));
+  attempt("udf directOnly, in a view", () => {
+    f.exec("create view sv as select secret() s");
+    return row("select s from sv");
+  });
+  attempt("udf directOnly, in a trigger", () => {
+    f.exec(`
+      create table tr (x); create table trlog (s);
+      create trigger tr_ins after insert on tr begin insert into trlog values (secret()); end;
+      insert into tr values (1);
+    `);
+    return rowsOf("select s from trlog");
+  });
+  attempt("udf directOnly, in a generated column", () => {
+    f.exec("create table gs (x, y as (secret()))");
+    return "created";
+  });
+  f.function("open", { deterministic: true }, () => "open");
+  attempt("udf without directOnly, in a view", () => {
+    f.exec("create view ov as select open() s");
+    return row("select s from ov");
+  });
+
+  // A thrown exception comes out of the call that ran the SQL, unchanged.
+  class CustomError extends Error {
+    extra: number;
+    constructor(message: string) {
+      super(message);
+      this.extra = 42;
+    }
+  }
+  const marker = new CustomError("thrown in a function");
+  f.function("boom", () => {
+    throw marker;
+  });
+  f.function("boomOn", (a) => {
+    if (a === 3) throw new Error(`boom on ${a}`);
+    return a ?? null;
+  });
+  const sameError = (body: () => void): string => {
+    try {
+      body();
+      return "no error";
+    } catch (error) {
+      const e = error as CustomError;
+      return `same object ${error === marker}, extra ${e.extra}, ${showError(error)}`;
+    }
+  };
+  attempt("udf throws, get", () => sameError(() => f.prepare("select boom() x").get()));
+  attempt("udf throws, all", () => sameError(() => f.prepare("select boom() x").all()));
+  attempt("udf throws, run", () => sameError(() => f.prepare("select boom() x").run()));
+  attempt("udf throws, exec", () => sameError(() => f.exec("select 1; select boom(); select 2")));
+  attempt("udf throws, in a where clause", () => sameError(() => f.prepare("select x from g where boom() = 1").all()));
+  attempt("udf throws, iterate", () => {
+    const seen: string[] = [];
+    try {
+      for (const r of f.prepare("select boomOn(x) v from (select 1 x union all select 2 union all select 3 union all select 4)").iterate())
+        seen.push(showRow(r as Record<string, Value>));
+    } catch (error) {
+      seen.push(showError(error));
+    }
+    return seen.join(" ");
+  });
+  attempt("udf throws, value out of range", () => row("select echo(9007199254740993) v"));
+  attempt("udf throws, inside a transaction", () => {
+    f.exec("create table tx (x); begin; insert into tx values (1)");
+    const before = f.isTransaction;
+    let message = "";
+    try {
+      f.exec("insert into tx values (boom())");
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    const after = f.isTransaction;
+    f.exec("commit");
+    return `${before} ${message} ${after} ${rowsOf("select x from tx")}`;
+  });
+  attempt("udf after exceptions", () => row("select plus(20, 22) r, boomOn(2) b"));
+
+  // A function that runs SQL on its own connection, with another function.
+  f.exec("create table kv (k text primary key, v integer); insert into kv values ('a', 1), ('b', 2)");
+  const lookup = f.prepare("select plus(v, 100) v from kv where k = ?");
+  f.function("lookup", (k) => {
+    const found = lookup.all(k ?? null);
+    return found.length === 0 ? null : (found[0] as { v: number }).v;
+  });
+  attempt("udf runs SQL itself", () => row("select lookup('a') a, lookup('b') b, lookup('z') z"));
+
+  // Aggregates.
+  f.exec(`
+    create table nums (grp text, x integer, y integer);
+    insert into nums values ('a', 1, 10), ('a', 2, 20), ('b', 3, 30), ('a', 4, 40), ('b', 5, 50), ('c', 6, null);
+  `);
+  f.aggregate("sumint", { start: 0, step: (acc, x) => (acc as number) + ((x as number | null) ?? 0) });
+  f.aggregate("joined", {
+    start: () => "",
+    step: (acc, x) => `${acc}${acc === "" ? "" : "+"}${x}`,
+    result: (acc) => `[${acc}]`,
+  });
+  attempt("aggregate", () => row("select sumint(x) s, joined(x) j from nums"));
+  attempt("aggregate, group by", () => rowsOf("select grp, sumint(x) s, joined(x) j from nums group by grp order by grp"));
+  attempt("aggregate, two at once", () => row("select sumint(x) a, sumint(y) b, joined(y) c from nums"));
+  attempt("aggregate, no rows", () => row("select sumint(x) s, joined(x) j from nums where 0"));
+  attempt("aggregate, no rows, group by", () => rowsOf("select grp, sumint(x) s from nums where 0 group by grp"));
+  attempt("aggregate, wrong argument count", () => row("select sumint(x, y) s from nums"));
+  f.aggregate("bigsum", {
+    start: 0n,
+    useBigIntArguments: true,
+    step: (acc, x) => (acc as bigint) + (x as bigint),
+  });
+  attempt("aggregate, bigint arguments", () => {
+    const s = f.prepare("select bigsum(v) s, typeof(bigsum(v)) t from (select 4611686018427387904 v union all select 4611686018427387903)");
+    s.setReadBigInts(true);
+    return showRow(s.get() as Record<string, Value>);
+  });
+  f.aggregate("argCount", {
+    start: 0,
+    varargs: true,
+    // A typed accumulator: scriptc cannot pass "(acc, ...rest)" where the
+    // untyped step shape is declared, so this takes the second signature.
+    step: (acc: number, ...xs: Value[]) => acc + xs.length,
+  });
+  attempt("aggregate, varargs", () => row("select argCount() a, argCount(x) b, argCount(x, y, grp) c from nums"));
+  f.aggregate("seen", { start: () => "", step: (acc) => `${acc}.` });
+  attempt("aggregate, step without values", () => row("select seen() s from nums"));
+
+  // A window function: an aggregate with inverse.
+  f.aggregate("winsum", {
+    start: 0,
+    step: (acc, x) => (acc as number) + (x as number),
+    inverse: (acc, x) => (acc as number) - (x as number),
+    result: (acc) => `=${acc}`,
+  });
+  attempt("window function", () =>
+    rowsOf(`select x, winsum(x) over w s, sum(x) over w builtin from nums
+            window w as (order by x rows between 1 preceding and 1 following) order by x`),
+  );
+  attempt("window function, partitions", () =>
+    rowsOf(`select grp, x, winsum(x) over (partition by grp order by x) s from nums order by grp, x`),
+  );
+  attempt("window function, as a plain aggregate", () => row("select winsum(x) s from nums"));
+  attempt("aggregate without inverse, as a window", () =>
+    rowsOf("select x, sumint(x) over (order by x rows between 1 preceding and current row) s from nums order by x"),
+  );
+
+  // Exceptions in each part of an aggregate. The step case has no result
+  // function: with one, Node 24 loses the step's exception and returns no
+  // rows (see NOTES.md), where this module throws it.
+  const aggThrows = (label: string, part: string) => {
+    f.aggregate(`fail_${part}`, {
+      start: () => {
+        if (part === "start") throw new Error(`${label}: start`);
+        return 0;
+      },
+      step: (acc, x) => {
+        if (part === "step" && x === 4) throw new Error(`${label}: step on ${x}`);
+        return (acc as number) + (x as number);
+      },
+      inverse: (acc, x) => {
+        if (part === "inverse") throw new Error(`${label}: inverse`);
+        return (acc as number) - (x as number);
+      },
+      result:
+        part === "step"
+          ? undefined
+          : (acc) => {
+              if (part === "result") throw new Error(`${label}: result`);
+              return acc;
+            },
+    });
+    attempt(`aggregate throws in ${part}`, () => row(`select fail_${part}(x) s from nums`));
+    attempt(`aggregate throws in ${part}, window`, () =>
+      rowsOf(`select x, fail_${part}(x) over (order by x rows between 1 preceding and current row) s from nums`),
+    );
+  };
+  for (const part of ["start", "step", "inverse", "result"]) aggThrows("agg", part);
+  attempt("aggregate after exceptions", () => row("select sumint(x) s from nums"));
+
+  // directOnly aggregates.
+  f.aggregate("dsum", { start: 0, directOnly: true, step: (acc, x) => (acc as number) + (x as number) });
+  attempt("aggregate directOnly, direct", () => row("select dsum(x) s from nums"));
+  attempt("aggregate directOnly, in a view", () => {
+    f.exec("create view dv as select dsum(x) s from nums");
+    return row("select s from dv");
+  });
+
+  // Node's argument checks that typed code can reach.
+  attempt("function, not a function", () => {
+    f.function("nf", 5);
+    return "defined";
+  });
+  attempt("aggregate, start missing", () => {
+    f.aggregate("ns", { start: undefined, step: (acc: unknown) => acc });
+    return "defined";
+  });
+  attempt("aggregate, step not a function", () => {
+    f.aggregate("ns", { start: 0, step: "step" });
+    return "defined";
+  });
+  attempt("aggregate, inverse not a function", () => {
+    f.aggregate("ns", { start: 0, step: (acc: unknown) => acc, inverse: 1 });
+    return "defined";
+  });
+
+  f.close();
+  attempt("function on a closed database", () => {
+    f.function("late", () => 1);
+    return "defined";
+  });
+  attempt("aggregate on a closed database", () => {
+    f.aggregate("late", { start: 0, step: (acc) => acc });
+    return "defined";
+  });
+}
+
+// ── day 4: location, serialize, deserialize, backup ─────────────────────
+// Serialized bytes carry the SQLite version that wrote them, and Node's
+// SQLite is not ours, so the test prints what the bytes do, not the bytes.
+{
+  mkdirSync("build/tmp", { recursive: true });
+  const file = "build/tmp/day4.db";
+  const copy = "build/tmp/day4-copy.db";
+  for (const f of [file, copy]) rmSync(f, { force: true });
+  const disk = new DatabaseSync(file);
+  disk.exec(`
+    create table t (id integer primary key, body text, data blob);
+    with recursive n(i) as (select 1 union all select i + 1 from n where i < 400)
+    insert into t (body, data) select 'row ' || i || ' ✓', zeroblob(i % 50) from n;
+  `);
+  const mem = new DatabaseSync(":memory:");
+  attempt("location of a file", () => {
+    const where = disk.location();
+    return where === null ? "null" : where.endsWith("build/tmp/day4.db") ? "ends with build/tmp/day4.db" : where;
+  });
+  attempt("location of :memory:", () => JSON.stringify(mem.location()));
+  attempt("location of temp", () => JSON.stringify(disk.location("temp")));
+  attempt("location of an unknown schema", () => JSON.stringify(disk.location("nope")));
+
+  const summary = (d: DatabaseSync): string =>
+    showRow(d.prepare("select count(*) n, sum(length(body)) chars, sum(length(data)) bytes from t").get() as Record<string, Value>);
+  let bytes: Uint8Array = new Uint8Array(0);
+  attempt("serialize", () => {
+    bytes = disk.serialize();
+    const header = new TextDecoder().decode(bytes.subarray(0, 15));
+    return `${JSON.stringify(header)}, whole pages ${bytes.length > 0 && bytes.length % 4096 === 0}`;
+  });
+  attempt("serialize an empty memory database", () => `length ${mem.serialize().length}`);
+  attempt("deserialize into :memory:", () => {
+    const before = mem.prepare("select 1 one");
+    mem.deserialize(bytes);
+    let old = "";
+    try {
+      before.get();
+      old = "still usable";
+    } catch (error) {
+      old = showError(error);
+    }
+    return `${summary(mem)} | earlier statement: ${old} | location ${JSON.stringify(mem.location())}`;
+  });
+  attempt("deserialized copy is separate", () => {
+    mem.exec("delete from t where id > 10");
+    return `${summary(mem)} | file still ${summary(disk)}`;
+  });
+  attempt("deserialize empty", () => {
+    mem.deserialize(new Uint8Array(0));
+    return "done";
+  });
+  attempt("deserialize garbage, then query", () => {
+    mem.deserialize(new TextEncoder().encode("not a database at all, just text that is long enough"));
+    return summary(mem);
+  });
+  attempt("deserialize inside a function", () => {
+    const d = new DatabaseSync(":memory:");
+    d.function("swap", () => {
+      d.deserialize(bytes);
+      return 1;
+    });
+    try {
+      return showRow(d.prepare("select swap() s").get() as Record<string, Value>);
+    } finally {
+      d.close();
+    }
+  });
+  attempt("serialize after close", () => {
+    const d = new DatabaseSync(":memory:");
+    d.close();
+    return `length ${d.serialize().length}`;
+  });
+
+  const backupAttempt = async (label: string, body: () => Promise<string>): Promise<void> => {
+    try {
+      console.log(`${label}: ${await body()}`);
+    } catch (error) {
+      console.log(`${label}: ${showError(error)}`);
+    }
+  };
+  await backupAttempt("backup", async () => {
+    const pages = await backup(disk, copy);
+    const b = new DatabaseSync(copy, { readOnly: true });
+    try {
+      return `pages > 0 ${pages > 0} | copy ${summary(b)}`;
+    } finally {
+      b.close();
+    }
+  });
+  await backupAttempt("backup, one page per round", async () => {
+    const seen: number[] = [];
+    const totals: number[] = [];
+    const pages = await backup(disk, copy, {
+      rate: 1,
+      progress: (p) => {
+        seen.push(p.remainingPages);
+        totals.push(p.totalPages);
+      },
+    });
+    if (totals.some((t) => t !== pages)) seen.push(-1);
+    let falling = true;
+    for (let i = 1; i < seen.length; i++) if (seen[i]! >= seen[i - 1]!) falling = false;
+    return `rounds ${seen.length === pages - 1 ? "pages - 1" : String(seen.length)}, remaining falls by one ${falling}, first ${seen[0] === pages - 1}`;
+  });
+  await backupAttempt("backup, rate 0", async () => String(await backup(disk, copy, { rate: 0 })));
+  await backupAttempt("backup, rate 1.5", async () => String(await backup(disk, copy, { rate: 1.5 })));
+  await backupAttempt("backup, unknown source schema", async () => String(await backup(disk, copy, { source: "nope" })));
+  await backupAttempt("backup, progress throws", async () =>
+    String(
+      await backup(disk, copy, {
+        rate: 1,
+        progress: () => {
+          throw new Error("stop the backup");
+        },
+      }),
+    ),
+  );
+  await backupAttempt("backup into a directory that does not exist", async () =>
+    String(await backup(disk, "build/tmp/no/such/dir/x.db")),
+  );
+  await backupAttempt("backup of a closed database", async () => {
+    const d = new DatabaseSync(":memory:");
+    d.close();
+    return String(await backup(d, copy));
+  });
+  disk.close();
+  mem.close();
+  for (const f of [file, copy]) rmSync(f, { force: true });
+}
+
+// A statement used before and after its table gains a column (found by the
+// migration test: column names were read before SQLite recompiled it).
+{
+  const d = new DatabaseSync(":memory:");
+  d.exec("create table g (a integer); insert into g values (1)");
+  const star = d.prepare("select * from g");
+  attempt("select * before alter", () => showRow(star.get() as Record<string, Value>));
+  d.exec("alter table g add column b text not null default 'new'");
+  attempt("select * after alter, get", () => showRow(star.get() as Record<string, Value>));
+  attempt("select * after alter, all", () => (star.all() as Record<string, Value>[]).map((r) => showRow(r)).join(" "));
+  attempt("select * after alter, iterate", () => {
+    const out: string[] = [];
+    for (const r of star.iterate()) out.push(showRow(r as Record<string, Value>));
+    return out.join(" ");
+  });
+  attempt("columns() after alter", () => star.columns().map((c) => c.name).join(", "));
   d.close();
 }
 

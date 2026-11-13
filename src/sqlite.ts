@@ -47,6 +47,47 @@ declare function sqxColumnDouble(stmt: bigint, index: number): number;
 declare function sqxColumnText(stmt: bigint, index: number, out: Uint8Array): bigint;
 declare function sqxColumnBlob(stmt: bigint, index: number, out: Uint8Array): bigint;
 declare function sqxVersion(out: Uint8Array): bigint;
+declare function sqxRow(stmt: bigint, out: Uint8Array): bigint;
+declare function sqxColumnsMode(): number;
+declare function sqxGetenv(name: string, out: Uint8Array): bigint;
+declare function sqxSerialize(db: bigint, schema: string): bigint;
+declare function sqxSerializedTake(out: Uint8Array): void;
+declare function sqxDeserialize(db: bigint, schema: string, data: Uint8Array): number;
+declare function sqxDbFilename(db: bigint, schema: string, out: Uint8Array): bigint;
+declare function sqxBackupOpen(src: bigint, path: string, source: string, target: string): bigint;
+declare function sqxBackupOk(backup: bigint): number;
+declare function sqxBackupStep(backup: bigint, pages: number): number;
+declare function sqxBackupTotal(backup: bigint): number;
+declare function sqxBackupRemaining(backup: bigint): number;
+declare function sqxBackupErrcode(backup: bigint): number;
+declare function sqxBackupErrmsg(backup: bigint, out: Uint8Array): bigint;
+declare function sqxBackupFinish(backup: bigint): void;
+declare function sqxStepRow(stmt: bigint, out: Uint8Array): bigint;
+declare function sqxSetDispatch(
+  fn: (op: number, id: bigint, ctx: bigint, argc: number, argv: bigint) => number,
+): void;
+declare function sqxCreateFunction(db: bigint, name: string, argc: number, flags: number, id: bigint): number;
+declare function sqxCreateAggregate(
+  db: bigint,
+  name: string,
+  argc: number,
+  flags: number,
+  id: bigint,
+  window: number,
+): number;
+declare function sqxAggSlot(ctx: bigint): bigint;
+declare function sqxAggSetSlot(ctx: bigint, value: bigint): void;
+declare function sqxValueType(argv: bigint, index: number): number;
+declare function sqxValueInt64(argv: bigint, index: number): bigint;
+declare function sqxValueDouble(argv: bigint, index: number): number;
+declare function sqxValueText(argv: bigint, index: number, out: Uint8Array): bigint;
+declare function sqxValueBlob(argv: bigint, index: number, out: Uint8Array): bigint;
+declare function sqxResultNull(ctx: bigint): void;
+declare function sqxResultDouble(ctx: bigint, value: number): void;
+declare function sqxResultInt64(ctx: bigint, value: bigint): void;
+declare function sqxResultText(ctx: bigint, value: string): void;
+declare function sqxResultBlob(ctx: bigint, value: Uint8Array): void;
+declare function sqxResultError(ctx: bigint, message: string): void;
 
 export type SQLInputValue = null | number | bigint | string | Uint8Array | boolean;
 export type SQLOutputValue = null | number | bigint | string | Uint8Array;
@@ -75,6 +116,66 @@ export interface DatabaseSyncOptions {
   returnArrays?: boolean;
   allowBareNamedParameters?: boolean;
   allowUnknownNamedParameters?: boolean;
+}
+
+/** An argument of a user-defined function as the function sees it when it
+ * declares fewer than all eight parameters: missing ones are undefined. */
+export type SQLFunctionArgument = SQLOutputValue | undefined;
+
+/** The shape `database.function` takes for a function written without
+ * parameter types, such as `(a, b) => …`: up to eight parameters.
+ *
+ * Node declares `(...args: SQLOutputValue[]) => SQLInputValue`, but scriptc
+ * 0.4.12 cannot pass a function with fixed parameters where a rest
+ * parameter is declared (SC1090), and TypeScript types an unannotated
+ * function from the first overload. So this shape comes first. Functions
+ * with parameter types, rest parameters (`(...xs: SQLOutputValue[]) => …`)
+ * or other return types take the second overload. */
+export type SQLFunction = (
+  a: SQLFunctionArgument,
+  b: SQLFunctionArgument,
+  c: SQLFunctionArgument,
+  d: SQLFunctionArgument,
+  e: SQLFunctionArgument,
+  f: SQLFunctionArgument,
+  g: SQLFunctionArgument,
+  h: SQLFunctionArgument,
+) => SQLInputValue;
+
+/** An aggregate's step or inverse written without parameter types:
+ * `(accumulator, value) => …`, up to seven values. */
+export type SQLAggregateStep = (
+  accumulator: SQLInputValue,
+  a: SQLFunctionArgument,
+  b: SQLFunctionArgument,
+  c: SQLFunctionArgument,
+  d: SQLFunctionArgument,
+  e: SQLFunctionArgument,
+  f: SQLFunctionArgument,
+  g: SQLFunctionArgument,
+) => SQLInputValue;
+
+export interface FunctionOptions {
+  deterministic?: boolean;
+  directOnly?: boolean;
+  useBigIntArguments?: boolean;
+  varargs?: boolean;
+}
+
+export interface AggregateOptions extends FunctionOptions {
+  start: SQLInputValue | (() => SQLInputValue);
+  step: SQLAggregateStep;
+  result?: (accumulator: SQLInputValue) => SQLInputValue;
+  inverse?: SQLAggregateStep;
+}
+
+/** Aggregate options whose functions have parameter types or rest
+ * parameters, which SQLAggregateStep does not take (see SQLFunction). */
+export interface AnyAggregateOptions extends FunctionOptions {
+  start: any;
+  step: any;
+  result?: any;
+  inverse?: any;
 }
 
 const SQLITE_OK = 0;
@@ -127,6 +228,15 @@ function returnArraysError(): SQLiteError {
 // function copies what fits and returns the full length; a longer value is
 // fetched again into a buffer of at least that size.
 let scratch = new Uint8Array(256);
+
+// Rows are read packed: one FFI call steps the statement and copies every
+// value of the row into rowBuffer (format in native/shim.c, sqx_row).
+// SCRIPTC_SQLITE_ROW_READS=columns reads them the day-1 way instead, one or
+// two calls per value, so a benchmark can compare the two in one binary.
+// (The C side reads the variable: process.env costs about 10 MiB per
+// thread in scriptc 0.4.12.)
+let rowBuffer = new Uint8Array(4096);
+const packedRows = sqxColumnsMode() === 0;
 const decoder = new TextDecoder();
 
 function fetchInto(fetch: (out: Uint8Array) => bigint): number {
@@ -170,12 +280,306 @@ function sqliteError(db: bigint, rc: number): SQLiteError {
   return error;
 }
 
+// ── User-defined functions ─────────────────────────────────────────────
+//
+// SQLite calls a user function from inside sqlite3_step, long after the
+// call that registered it, so the shim holds one retained FFI callback per
+// thread, `dispatch` below, and passes it the function's id and SQLite's
+// context and argument pointers. Functions are kept here by id, per thread,
+// like everything else in this module.
+//
+// An exception in user code must never leave `dispatch`: a scriptc callback
+// that throws returns 0 to C and the exception only resumes once the outer
+// native call returns. So `dispatch` catches everything, keeps the
+// exception, and tells the shim to fail the SQL function. The call that
+// stepped the statement then throws that exception instead of SQLite's
+// error, as node:sqlite does.
+
+const OP_FUNC = 0;
+const OP_STEP = 1;
+const OP_INVERSE = 2;
+const OP_VALUE = 3;
+const OP_FINAL = 4;
+const OP_DESTROY = 5;
+const SQLITE_DETERMINISTIC = 0x800;
+const SQLITE_DIRECTONLY = 0x80000;
+
+type AnyCall = (...args: unknown[]) => unknown;
+
+interface Registered {
+  bigints: boolean;
+  fn: unknown;
+  start: unknown;
+  inverse: unknown;
+  result: unknown;
+}
+
+/** One aggregate group's state, found through the slot number the shim
+ * keeps in SQLite's aggregate context. */
+interface Group {
+  value: unknown;
+  window: boolean;
+}
+
+const registered: Map<bigint, Registered> = new Map();
+const groups: Map<bigint, Group> = new Map();
+let nextFunctionId = 0n;
+let nextGroupId = 0n;
+let dispatchSet = false;
+let callbackFailed = false;
+let callbackError: unknown = undefined;
+/** User code running inside a SQLite callback right now (deserialize
+ * refuses then, as in Node). */
+let callbackDepth = 0;
+
+/** The error a failed step or exec throws: the exception a user function
+ * threw, if one did, else SQLite's. */
+function stepError(db: bigint, rc: number): unknown {
+  if (callbackFailed) {
+    const error = callbackError;
+    callbackFailed = false;
+    callbackError = undefined;
+    return error;
+  }
+  return sqliteError(db, rc);
+}
+
+/** Forget an exception left by a callback whose failure SQLite ignored
+ * (an aggregate finalized while a statement was reset). */
+function clearCallbackError(): void {
+  callbackFailed = false;
+  callbackError = undefined;
+}
+
+function dispatch(op: number, id: bigint, ctx: bigint, argc: number, argv: bigint): number {
+  if (op === OP_DESTROY) {
+    registered.delete(id);
+    return 1;
+  }
+  callbackDepth++;
+  try {
+    return dispatchCall(op, id, ctx, argc, argv);
+  } finally {
+    callbackDepth--;
+  }
+}
+
+function dispatchCall(op: number, id: bigint, ctx: bigint, argc: number, argv: bigint): number {
+  try {
+    const entry = registered.get(id);
+    if (entry === undefined) {
+      sqxResultError(ctx, "user-defined function is no longer defined");
+      return 1;
+    }
+    if (op === OP_FUNC) {
+      setResult(ctx, (entry.fn as AnyCall)(...functionArguments(argc, argv, entry.bigints)));
+      return 1;
+    }
+    const slot = groupSlot(ctx, entry);
+    if (slot < 0n) return 1;
+    const group = groups.get(slot)!;
+    if (op === OP_STEP || op === OP_INVERSE) {
+      const args = functionArguments(argc, argv, entry.bigints);
+      const fn = op === OP_STEP ? entry.fn : entry.inverse;
+      group.value = (fn as AnyCall)(group.value, ...args);
+      return 1;
+    }
+    // OP_VALUE or OP_FINAL. Node gives no result from xFinal once the
+    // aggregate ran as a window function; SQLite never uses it then.
+    if (op === OP_VALUE) group.window = true;
+    else if (group.window) {
+      groups.delete(slot);
+      return 1;
+    }
+    try {
+      setResult(ctx, entry.result !== undefined ? (entry.result as AnyCall)(group.value) : group.value);
+    } finally {
+      if (op === OP_FINAL) groups.delete(slot);
+    }
+    return 1;
+  } catch (error) {
+    // The first exception wins: once a step fails, SQLite still finalizes
+    // the group, and a result function that throws too must not hide the
+    // cause. (Node 24 loses the step's exception when the aggregate has a
+    // result function: get() and all() return undefined; see NOTES.md.)
+    if (!callbackFailed) {
+      callbackFailed = true;
+      callbackError = error;
+    }
+    return 0;
+  }
+}
+
+/** The slot of the group SQLite is aggregating, set up with the start
+ * value on first use; -1 after setting an error result. */
+function groupSlot(ctx: bigint, entry: Registered): bigint {
+  const slot = sqxAggSlot(ctx);
+  if (slot !== 0n) {
+    if (slot < 0n) sqxResultError(ctx, "out of memory");
+    return slot;
+  }
+  const start = typeof entry.start === "function" ? (entry.start as AnyCall)() : entry.start;
+  const created = ++nextGroupId;
+  groups.set(created, { value: start, window: false });
+  sqxAggSetSlot(ctx, created);
+  return created;
+}
+
+function functionArguments(argc: number, argv: bigint, bigints: boolean): SQLOutputValue[] {
+  const args: SQLOutputValue[] = [];
+  for (let i = 0; i < argc; i++) {
+    const type = sqxValueType(argv, i);
+    if (type === SQLITE_INTEGER) {
+      const value = sqxValueInt64(argv, i);
+      if (bigints) args.push(value);
+      else if (value > MAX_SAFE || value < -MAX_SAFE)
+        throw new SQLiteError(`Value is too large to be represented as a JavaScript number: ${value}`, "ERR_OUT_OF_RANGE");
+      else args.push(Number(value));
+    } else if (type === SQLITE_FLOAT) args.push(sqxValueDouble(argv, i));
+    else if (type === SQLITE_TEXT) args.push(readText((out) => sqxValueText(argv, i, out)));
+    else if (type === SQLITE_BLOB) args.push(readBytes((out) => sqxValueBlob(argv, i, out)));
+    else args.push(null);
+  }
+  return args;
+}
+
+/** A user function's return value as the SQL result, by Node's rules:
+ * null and undefined → NULL, number → REAL, string → TEXT, Uint8Array →
+ * BLOB, bigint → INTEGER. Anything else (booleans too) is an SQL error. */
+function setResult(ctx: bigint, value: unknown): void {
+  if (value === null || value === undefined) sqxResultNull(ctx);
+  else if (typeof value === "number") sqxResultDouble(ctx, value);
+  else if (typeof value === "string") sqxResultText(ctx, value);
+  else if (value instanceof Uint8Array) sqxResultBlob(ctx, value);
+  else if (typeof value === "bigint") {
+    if (value < INT64_MIN || value > INT64_MAX) sqxResultError(ctx, "BigInt value is too large for SQLite");
+    else sqxResultInt64(ctx, value);
+  } else if (value instanceof Promise) sqxResultError(ctx, "Asynchronous user-defined functions are not supported");
+  else sqxResultError(ctx, "Returned JavaScript value cannot be converted to a SQLite value");
+}
+
+/** @internal For tests: user functions this thread keeps, and aggregate
+ * groups in progress. */
+export function _userFunctionState(): { functions: number; groups: number } {
+  return { functions: registered.size, groups: groups.size };
+}
+
+/** Registers `dispatch` with the shim, once per thread. */
+function ensureDispatch(): void {
+  if (dispatchSet) return;
+  sqxSetDispatch(dispatch);
+  dispatchSet = true;
+}
+
+function functionLength(fn: unknown): number {
+  return (fn as AnyCall).length;
+}
+
 function checkBoolean(name: string, value: boolean | undefined): void {
   if (value !== undefined && typeof value !== "boolean")
     throw new SQLiteError(`The "options.${name}" argument must be a boolean.`, "ERR_INVALID_ARG_TYPE");
 }
 
+/** An environment variable, or undefined. Not part of node:sqlite: in
+ * scriptc 0.4.12, reading process.env makes a program use tens of MiB
+ * more memory (a hello-world goes from 4 to 43 MiB); this reads it through
+ * C's getenv instead. Under Node, use process.env. */
+export function getEnv(name: string): string | undefined {
+  const value = readTextOrNull((out) => sqxGetenv(name, out));
+  return value === null ? undefined : value;
+}
+
 /** The SQLite version compiled into this program, such as "3.54.1". */
+function schemaName(dbName: string | undefined): string {
+  if (dbName === undefined) return "main";
+  if (typeof dbName !== "string") throw new SQLiteError('The "dbName" argument must be a string.', "ERR_INVALID_ARG_TYPE");
+  return dbName;
+}
+
+export interface BackupOptions {
+  /** Pages copied per round (default 100). */
+  rate?: number;
+  /** The schema copied from (default "main"). */
+  source?: string;
+  /** The schema written to in the destination (default "main"). */
+  target?: string;
+  /** Called between rounds while pages remain. */
+  progress?: (progress: { totalPages: number; remainingPages: number }) => void;
+}
+
+/** Copies `sourceDb` into the database file at `path` while it stays
+ * usable, as Node's `backup`: `rate` pages per round, the event loop
+ * runs between rounds, and the promise gives the number of pages. Node
+ * copies on its thread pool; here each round runs on this thread. */
+export function backup(sourceDb: DatabaseSync, path: string, options?: BackupOptions): Promise<number> {
+  const db = sourceDb._handle();
+  if (typeof path !== "string")
+    throw new SQLiteError('The "path" argument must be a string, Uint8Array, or URL without null bytes.', "ERR_INVALID_ARG_TYPE");
+  const o: BackupOptions = options ?? {};
+  let rate = 100;
+  if (o.rate !== undefined) {
+    if (typeof o.rate !== "number" || !Number.isInteger(o.rate) || o.rate > 2147483647 || o.rate < -2147483648)
+      throw new SQLiteError('The "options.rate" argument must be an integer.', "ERR_INVALID_ARG_TYPE");
+    if (o.rate <= 0)
+      throw new SQLiteError('The "options.rate" argument must be a positive integer.', "ERR_OUT_OF_RANGE");
+    rate = o.rate;
+  }
+  if (o.source !== undefined && typeof o.source !== "string")
+    throw new SQLiteError('The "options.source" argument must be a string.', "ERR_INVALID_ARG_TYPE");
+  if (o.target !== undefined && typeof o.target !== "string")
+    throw new SQLiteError('The "options.target" argument must be a string.', "ERR_INVALID_ARG_TYPE");
+  if (o.progress !== undefined && typeof o.progress !== "function")
+    throw new SQLiteError('The "options.progress" argument must be a function.', "ERR_INVALID_ARG_TYPE");
+  return runBackup(db, path, rate, o.source ?? "main", o.target ?? "main", o.progress);
+}
+
+const SQLITE_BUSY = 5;
+const SQLITE_LOCKED = 6;
+
+function nextTurn(): Promise<void> {
+  return new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
+function backupError(handle: bigint): SQLiteError {
+  const errcode = sqxBackupErrcode(handle);
+  const error = new SQLiteError(readText((out) => sqxBackupErrmsg(handle, out)), "ERR_SQLITE_ERROR");
+  error.errcode = errcode;
+  error.errstr = readText((out) => sqxErrstr(errcode, out));
+  return error;
+}
+
+async function runBackup(
+  db: bigint,
+  path: string,
+  rate: number,
+  source: string,
+  target: string,
+  progress: ((progress: { totalPages: number; remainingPages: number }) => void) | undefined,
+): Promise<number> {
+  await nextTurn();
+  const handle = sqxBackupOpen(db, path, source, target);
+  if (handle === NULL_HANDLE) throw sqliteError(NULL_HANDLE, 7); // SQLITE_NOMEM
+  try {
+    if (sqxBackupOk(handle) === 0) throw backupError(handle);
+    for (;;) {
+      const rc = sqxBackupStep(handle, rate);
+      if (rc !== SQLITE_OK && rc !== SQLITE_DONE && rc !== SQLITE_BUSY && rc !== SQLITE_LOCKED)
+        throw sqliteError(NULL_HANDLE, rc);
+      const total = sqxBackupTotal(handle);
+      const remaining = sqxBackupRemaining(handle);
+      if (remaining !== 0) {
+        if (progress !== undefined) progress({ totalPages: total, remainingPages: remaining });
+        await nextTurn();
+        continue;
+      }
+      if (rc !== SQLITE_DONE) throw backupError(handle);
+      return total;
+    }
+  } finally {
+    sqxBackupFinish(handle);
+  }
+}
+
 export function sqliteVersion(): string {
   return readText((out) => sqxVersion(out));
 }
@@ -256,13 +660,52 @@ export class DatabaseSync {
 
   close(): void {
     const db = this.#handle();
+    this.#finalizeAll();
+    sqxClose(db);
+    this.#db = NULL_HANDLE;
+  }
+
+  /** The file of the database, or null for an in-memory or temporary
+   * one. `dbName` is the schema: "main" (the default), "temp", or an
+   * attached name. */
+  location(dbName?: string): string | null {
+    const db = this.#handle();
+    return readTextOrNull((out) => sqxDbFilename(db, schemaName(dbName), out));
+  }
+
+  /** The whole database as bytes, as SQLite would write it to a file. */
+  serialize(dbName?: string): Uint8Array {
+    const db = this.#handle();
+    const size = Number(sqxSerialize(db, schemaName(dbName)));
+    if (size < 0) throw sqliteError(db, sqxErrcode(db));
+    const out = new Uint8Array(size);
+    sqxSerializedTake(out);
+    return out;
+  }
+
+  /** Replaces the database (or schema `options.dbName`) with `buffer`,
+   * which serialize() gave. Statements prepared before are finalized, as
+   * in Node. */
+  deserialize(buffer: Uint8Array, options?: { dbName?: string }): void {
+    const db = this.#handle();
+    if (callbackDepth > 0) throw stateError("database cannot be deserialized while in a callback");
+    if (!(buffer instanceof Uint8Array))
+      throw new SQLiteError('The "buffer" argument must be a Uint8Array.', "ERR_INVALID_ARG_TYPE");
+    if (buffer.length === 0)
+      throw new SQLiteError('The "buffer" argument must not be empty.', "ERR_INVALID_ARG_VALUE");
+    const name = schemaName(options === undefined ? undefined : options.dbName);
+    this.#finalizeAll();
+    this.#generation++;
+    const rc = sqxDeserialize(db, name, buffer);
+    if (rc !== SQLITE_OK) throw sqliteError(db, rc);
+  }
+
+  #finalizeAll(): void {
     for (const handles of this.#pool.values()) for (const stmt of handles) sqxFinalize(stmt);
     for (const stmt of this.#lent) sqxFinalize(stmt);
     this.#pool = new Map();
     this.#pooled = 0;
     this.#lent = new Set();
-    sqxClose(db);
-    this.#db = NULL_HANDLE;
   }
 
   [Symbol.dispose](): void {
@@ -271,7 +714,96 @@ export class DatabaseSync {
 
   exec(sql: string): void {
     const db = this.#handle();
+    clearCallbackError();
     const rc = sqxExec(db, sql);
+    if (rc !== SQLITE_OK) throw stepError(db, rc);
+  }
+
+  /** Defines or replaces the SQL function `name`, as in Node. Unless
+   * `varargs` is set, SQL must call it with exactly `fn.length` arguments.
+   * See SQLFunction for why there are two signatures. */
+  function(name: string, fn: SQLFunction): void;
+  function(name: string, options: FunctionOptions, fn: SQLFunction): void;
+  function(name: string, fn: any): void;
+  function(name: string, options: FunctionOptions, fn: any): void;
+  function(name: string, second: unknown, third?: unknown): void {
+    const db = this.#handle();
+    if (typeof name !== "string")
+      throw new SQLiteError('The "name" argument must be a string.', "ERR_INVALID_ARG_TYPE");
+    const fn: unknown = third === undefined ? second : third;
+    let options: FunctionOptions = {};
+    if (third !== undefined) {
+      if (second === null || typeof second !== "object")
+        throw new SQLiteError('The "options" argument must be an object.', "ERR_INVALID_ARG_TYPE");
+      options = second as FunctionOptions;
+    }
+    checkBoolean("useBigIntArguments", options.useBigIntArguments);
+    checkBoolean("varargs", options.varargs);
+    checkBoolean("deterministic", options.deterministic);
+    checkBoolean("directOnly", options.directOnly);
+    if (typeof fn !== "function")
+      throw new SQLiteError('The "function" argument must be a function.', "ERR_INVALID_ARG_TYPE");
+    const argc = options.varargs === true ? -1 : functionLength(fn);
+    let flags = 0;
+    if (options.deterministic === true) flags |= SQLITE_DETERMINISTIC;
+    if (options.directOnly === true) flags |= SQLITE_DIRECTONLY;
+    ensureDispatch();
+    const id = ++nextFunctionId;
+    registered.set(id, {
+      bigints: options.useBigIntArguments === true,
+      fn,
+      start: undefined,
+      inverse: undefined,
+      result: undefined,
+    });
+    // On failure SQLite drops the function, which removes it from
+    // `registered` again.
+    const rc = sqxCreateFunction(db, name, argc, flags, id);
+    if (rc !== SQLITE_OK) throw sqliteError(db, rc);
+  }
+
+  /** Defines or replaces the aggregate `name`, as in Node; with `inverse`
+   * it is also a window function. Like Node, this ignores `deterministic`. */
+  aggregate(name: string, options: AggregateOptions): void;
+  aggregate(name: string, options: AnyAggregateOptions): void;
+  aggregate(name: string, options: unknown): void {
+    const db = this.#handle();
+    const o = options as AnyAggregateOptions;
+    const start: unknown = o.start;
+    const step: unknown = o.step;
+    const result: unknown = o.result;
+    const inverse: unknown = o.inverse;
+    if (start === undefined)
+      throw new SQLiteError(
+        'The "options.start" argument must be a function or a primitive value.',
+        "ERR_INVALID_ARG_TYPE",
+      );
+    if (typeof step !== "function")
+      throw new SQLiteError('The "options.step" argument must be a function.', "ERR_INVALID_ARG_TYPE");
+    checkBoolean("useBigIntArguments", o.useBigIntArguments);
+    checkBoolean("varargs", o.varargs);
+    checkBoolean("directOnly", o.directOnly);
+    if (inverse !== undefined && typeof inverse !== "function")
+      throw new SQLiteError('The "options.inverse" argument must be a function.', "ERR_INVALID_ARG_TYPE");
+    // Node's count: the step's parameters after the accumulator, or the
+    // inverse's if it takes more, and at least 0.
+    let argc = -1;
+    if (o.varargs !== true) {
+      argc = functionLength(step) - 1;
+      const other = inverse !== undefined ? functionLength(inverse) : functionLength(step);
+      argc = Math.max(argc, other - 1, 0);
+    }
+    ensureDispatch();
+    const id = ++nextFunctionId;
+    registered.set(id, {
+      bigints: o.useBigIntArguments === true,
+      fn: step,
+      start,
+      inverse,
+      result: typeof result === "function" ? result : undefined,
+    });
+    const flags = o.directOnly === true ? SQLITE_DIRECTONLY : 0;
+    const rc = sqxCreateAggregate(db, name, argc, flags, id, inverse !== undefined ? 1 : 0);
     if (rc !== SQLITE_OK) throw sqliteError(db, rc);
   }
 
@@ -436,7 +968,7 @@ export class StatementSync {
       const db = this.#db._handle();
       let rc = sqxStep(stmt);
       while (rc === SQLITE_ROW) rc = sqxStep(stmt);
-      if (rc !== SQLITE_DONE) throw sqliteError(db, rc);
+      if (rc !== SQLITE_DONE) throw stepError(db, rc);
       const changes = sqxChanges(db);
       const rowid = sqxLastInsertRowid(db);
       if (this.#settings.readBigInts) return { changes, lastInsertRowid: rowid };
@@ -449,10 +981,8 @@ export class StatementSync {
   get(...params: unknown[]): SQLRow | undefined {
     const stmt = this.#start(params);
     try {
-      const rc = sqxStep(stmt);
-      if (rc === SQLITE_ROW) return this.#row(stmt, this.#columnNames(stmt));
-      if (rc !== SQLITE_DONE) throw sqliteError(this.#db._handle(), rc);
-      return undefined;
+      const row = this.#next(stmt, []);
+      return row === null ? undefined : row;
     } finally {
       this.#db._release(this.#sql, stmt);
     }
@@ -462,13 +992,8 @@ export class StatementSync {
     const stmt = this.#start(params);
     try {
       const rows: SQLRow[] = [];
-      const names = this.#columnNames(stmt);
-      let rc = sqxStep(stmt);
-      while (rc === SQLITE_ROW) {
-        rows.push(this.#row(stmt, names));
-        rc = sqxStep(stmt);
-      }
-      if (rc !== SQLITE_DONE) throw sqliteError(this.#db._handle(), rc);
+      const names: string[] = [];
+      for (let row = this.#next(stmt, names); row !== null; row = this.#next(stmt, names)) rows.push(row);
       return rows;
     } finally {
       this.#db._release(this.#sql, stmt);
@@ -478,7 +1003,7 @@ export class StatementSync {
   iterate(...params: unknown[]): StatementIterator {
     const stmt = this.#start(params);
     try {
-      return new StatementIterator(this, stmt, this.#columnNames(stmt), this.#calls);
+      return new StatementIterator(this, stmt, [], this.#calls);
     } catch (error) {
       this.#db._release(this.#sql, stmt);
       throw error;
@@ -498,10 +1023,8 @@ export class StatementSync {
   _step(stmt: bigint, names: string[], call: number): SQLRow | null {
     this.#check();
     if (call !== this.#calls) throw stateError("iterator was invalidated");
-    const rc = sqxStep(stmt);
-    if (rc === SQLITE_ROW) return this.#row(stmt, names);
-    if (rc !== SQLITE_DONE) throw sqliteError(this.#db._handle(), rc);
-    return null;
+    clearCallbackError();
+    return this.#next(stmt, names);
   }
 
   /** @internal An iterator is done with its statement. */
@@ -517,6 +1040,7 @@ export class StatementSync {
   #start(params: unknown[]): bigint {
     this.#check();
     this.#calls++;
+    clearCallbackError();
     const stmt = this.#db._acquire(this.#sql);
     try {
       this.#bind(stmt, params);
@@ -590,6 +1114,75 @@ export class StatementSync {
     const count = sqxColumnCount(stmt);
     for (let i = 0; i < count; i++) names.push(readText((out) => sqxColumnName(stmt, i, out)));
     return names;
+  }
+
+  /** Steps: the next row, or null when there are no more. `names` starts
+   * empty and is filled when the first row arrives: a pooled statement
+   * whose table changed (ALTER TABLE) is recompiled by SQLite during that
+   * step, and only then has its new columns. */
+  #next(stmt: bigint, names: string[]): SQLRow | null {
+    if (!packedRows) {
+      const rc = sqxStep(stmt);
+      if (rc === SQLITE_ROW) {
+        if (names.length === 0) for (const n of this.#columnNames(stmt)) names.push(n);
+        return this.#row(stmt, names);
+      }
+      if (rc !== SQLITE_DONE) throw stepError(this.#db._handle(), rc);
+      return null;
+    }
+    // Keep the buffer this call used: a user function that runs a query
+    // during the step may replace rowBuffer meanwhile.
+    let buffer = rowBuffer;
+    let n = Number(sqxStepRow(stmt, buffer));
+    if (n < 0) {
+      const rc = -1 - n;
+      if (rc !== SQLITE_DONE) throw stepError(this.#db._handle(), rc);
+      return null;
+    }
+    if (n > buffer.length) {
+      buffer = new Uint8Array(Math.max(n, buffer.length * 2));
+      rowBuffer = buffer;
+      n = Number(sqxRow(stmt, buffer));
+    }
+    if (names.length === 0) for (const name of this.#columnNames(stmt)) names.push(name);
+    return this.#unpack(buffer, names);
+  }
+
+  #unpack(buffer: Uint8Array, names: string[]): SQLRow {
+    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    // Rows have no prototype, as in Node.
+    const row = Object.create(null) as SQLRow;
+    let at = 0;
+    for (let i = 0; i < names.length; i++) {
+      const type = buffer[at]!;
+      at++;
+      let value: SQLOutputValue = null;
+      if (type === SQLITE_INTEGER) {
+        if (this.#settings.readBigInts) value = view.getBigInt64(at, true);
+        else {
+          // Exact as a number while the high word is within ±2^21.
+          const high = view.getInt32(at + 4, true);
+          const n = high * 4294967296 + view.getUint32(at, true);
+          if (high < -0x200000 || high >= 0x200000 || n < -Number.MAX_SAFE_INTEGER) {
+            const big = view.getBigInt64(at, true);
+            throw new SQLiteError(`Value is too large to be represented as a JavaScript number: ${big}`, "ERR_OUT_OF_RANGE");
+          }
+          value = n;
+        }
+        at += 8;
+      } else if (type === SQLITE_FLOAT) {
+        value = view.getFloat64(at, true);
+        at += 8;
+      } else if (type === SQLITE_TEXT || type === SQLITE_BLOB) {
+        const length = view.getUint32(at, true);
+        at += 4;
+        if (type === SQLITE_TEXT) value = length === 0 ? "" : decoder.decode(buffer.subarray(at, at + length));
+        else value = buffer.slice(at, at + length);
+        at += length;
+      }
+      row[names[i]!] = value;
+    }
+    return row;
   }
 
   #row(stmt: bigint, names: string[]): SQLRow {

@@ -1,6 +1,6 @@
 // A tiny notes tool, built as its own project on top of scriptc-sqlite:
 //   app add "text"      app list      app find word
-import { DatabaseSync } from "scriptc-sqlite";
+import { DatabaseSync, getEnv } from "scriptc-sqlite";
 
 declare function exampleTag(text: string): number;
 
@@ -13,7 +13,8 @@ type Note = {
   tag: string;
 };
 
-const db = new DatabaseSync(process.env["NOTES_DB"] ?? "notes.db");
+// getEnv, not process.env, which costs scriptc programs tens of MiB.
+const db = new DatabaseSync(getEnv("NOTES_DB") ?? "notes.db");
 db.exec("create table if not exists notes (id integer primary key, body text not null, tag text not null)");
 
 const [command, ...words] = process.argv.slice(2);

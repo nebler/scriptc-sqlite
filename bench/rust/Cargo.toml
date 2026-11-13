@@ -1,0 +1,12 @@
+[package]
+name = "rust-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The benchmark workloads on rusqlite with SQLite compiled in (`bundled`).
+[dependencies]
+rusqlite = { version = "=0.37.0", features = ["bundled", "functions"] }
+
+[profile.release]
+opt-level = 3
