@@ -2,6 +2,14 @@
 
 Uses the published `scriptc@0.4.12` from npm. Days 1 and 2 were built and checked in a Linux arm64 sandbox (gVisor); macOS arm64 was checked afterwards. Day 3 ran in a different Linux arm64 sandbox, with Zig as the C toolchain.
 
+## Day 5, continued: runMany and numberFunction
+
+**`stmt.runMany(count, bind)`** and **`db.numberFunction(name, fn)`** (README, "Fast writes and number functions"), for the two workloads where Goose was still ahead after typed reads (inserts 1.25×, functions 2.6× on Linux arm64).
+
+- **Inserts:** 1060 ms against 1555 ms with `run()` in a loop, on the Linux arm64 host. `runMany` takes a statement from the pool once, binds through a `Parameters` object by position (the anonymous-parameter indexes found once), and steps, resets and clears bindings in one C call per row (`sqx_step_reset`), adding up `sqlite3_changes64` in a C thread-local.
+- **Functions:** 163 ms against 293 ms with `db.function`. The function has a fixed type, `(a: number, b: number, c: number, d: number) => number`, so scriptc calls it directly instead of through an `unknown` function (an adapter, boxing every argument). Arguments come from C as doubles in one call each (`sqx_value_number`, NaN for a non-number); the dispatcher also lost a redundant `try/finally` and gained a one-entry cache in front of the function map.
+- **What's left in the function job:** mostly SQLite (the VM, `sum`, page reads) and the scriptc callback trampoline.
+
 ## Day 5, continued: typed reads
 
 **`StatementSync.map()` and `forEach()` with a typed column reader** (README, "Fast typed reads"). With Node's API, most of a read is building a dynamic row object and the caller's `row as T` check (about 1.3 µs a row here, against 0.17 µs for SQLite itself). Reading columns by index into an object literal of a declared type skips both.

@@ -31,6 +31,9 @@ declare function sqxPrepareRc(): number;
 declare function sqxFinalize(stmt: bigint): number;
 declare function sqxReset(stmt: bigint): number;
 declare function sqxStep(stmt: bigint): number;
+declare function sqxStepReset(stmt: bigint): number;
+declare function sqxTakeChanges(): number;
+declare function sqxClearBindings(stmt: bigint): void;
 declare function sqxSql(stmt: bigint, out: Uint8Array): bigint;
 declare function sqxExpandedSql(stmt: bigint, out: Uint8Array): bigint;
 declare function sqxParamCount(stmt: bigint): number;
@@ -87,6 +90,7 @@ declare function sqxValueType(index: number): number;
 declare function sqxValueInt64(index: number): bigint;
 declare function sqxValueDouble(index: number): number;
 declare function sqxValueSafeInt(index: number): number;
+declare function sqxValueNumber(index: number): number;
 declare function sqxValueText(index: number, out: Uint8Array): number;
 declare function sqxValueBlob(index: number, out: Uint8Array): number;
 declare function sqxResultNull(): void;
@@ -127,6 +131,10 @@ export interface DatabaseSyncOptions {
   allowBareNamedParameters?: boolean;
   allowUnknownNamedParameters?: boolean;
 }
+
+/** A function for db.numberFunction: up to four number arguments, a
+ * number result. Fixed parameter types let scriptc call it directly. */
+export type NumberFunction = (a: number, b: number, c: number, d: number) => number;
 
 /** An argument of a user-defined function as the function sees it when it
  * declares fewer than all eight parameters: missing ones are undefined. */
@@ -369,10 +377,13 @@ type AnyCall = (...args: unknown[]) => unknown;
  * costs scriptc 0.4.12 about as much as the call itself. */
 interface Registered {
   bigints: boolean;
-  fn: AnyCall;
+  /** The function, or an aggregate's step; null for a numberFunction. */
+  fn: AnyCall | null;
   start: unknown;
   inverse: AnyCall | null;
   result: AnyCall | null;
+  /** Set for db.numberFunction: called directly, with numbers. */
+  num: NumberFunction | null;
 }
 
 /** One aggregate group's state, found through the slot number the shim
@@ -414,35 +425,57 @@ function clearCallbackError(): void {
   callbackError = undefined;
 }
 
+// The function looked up last: a function called once per row is then
+// found without a map lookup. Cleared when SQLite drops that function.
+let lastId = 0;
+let lastEntry: Registered | undefined = undefined;
+
 function dispatch(op: number, id: number, argc: number): number {
   if (op === OP_DESTROY) {
     registered.delete(id);
+    if (id === lastId) {
+      lastId = 0;
+      lastEntry = undefined;
+    }
     return 1;
   }
+  // No try/finally: dispatchCall catches everything and never throws.
   callbackDepth++;
-  try {
-    return dispatchCall(op, id, argc);
-  } finally {
-    callbackDepth--;
-  }
+  const done = dispatchCall(op, id, argc);
+  callbackDepth--;
+  return done;
 }
 
 function dispatchCall(op: number, id: number, argc: number): number {
   try {
-    const entry = registered.get(id);
+    let entry = lastEntry;
+    if (id !== lastId || entry === undefined) {
+      entry = registered.get(id);
+      lastId = id;
+      lastEntry = entry;
+    }
     if (entry === undefined) {
       sqxResultError("user-defined function is no longer defined");
       return 1;
     }
     if (op === OP_FUNC) {
-      setResult(callFunction(entry.fn, argc, entry.bigints));
+      const num = entry.num;
+      if (num !== null) {
+        const a = argc > 0 ? numberArgument(0) : 0;
+        const b = argc > 1 ? numberArgument(1) : 0;
+        const c = argc > 2 ? numberArgument(2) : 0;
+        const d = argc > 3 ? numberArgument(3) : 0;
+        sqxResultDouble(num(a, b, c, d));
+        return 1;
+      }
+      setResult(callFunction(entry.fn!, argc, entry.bigints));
       return 1;
     }
     const slot = groupSlot(entry);
     if (slot < 0) return 1;
     const group = groups.get(slot)!;
     if (op === OP_STEP || op === OP_INVERSE) {
-      const fn = op === OP_STEP ? entry.fn : entry.inverse!;
+      const fn = op === OP_STEP ? entry.fn! : entry.inverse!;
       group.value = callStep(fn, group.value, argc, entry.bigints);
       return 1;
     }
@@ -502,6 +535,18 @@ function functionArgument(i: number, bigints: boolean): SQLOutputValue {
   if (type === SQLITE_TEXT) return valueText(i);
   if (type === SQLITE_BLOB) return valueBlob(i);
   return null;
+}
+
+/** Argument i of a numberFunction call, which must be a number. */
+function numberArgument(i: number): number {
+  const value = sqxValueNumber(i);
+  if (value === value) return value;
+  const type = sqxValueType(i);
+  if (type === SQLITE_INTEGER) {
+    const big = sqxValueInt64(i);
+    throw new SQLiteError(`Value is too large to be represented as a JavaScript number: ${big}`, "ERR_OUT_OF_RANGE");
+  }
+  throw new SQLiteError(`Argument ${i} holds ${columnKind(type)}, not a number`, "ERR_INVALID_ARG_TYPE");
 }
 
 function functionArguments(argc: number, bigints: boolean): SQLOutputValue[] {
@@ -866,6 +911,7 @@ export class DatabaseSync {
       start: undefined,
       inverse: null,
       result: null,
+      num: null,
     });
     // On failure SQLite drops the function, which removes it from
     // `registered` again.
@@ -875,6 +921,39 @@ export class DatabaseSync {
 
   /** Defines or replaces the aggregate `name`, as in Node; with `inverse`
    * it is also a window function. Like Node, this ignores `deterministic`. */
+  /** Like function(), for a function of up to four numbers that returns a
+   * number: `db.numberFunction("twice", (x) => x * 2)`. Not in node:sqlite.
+   * Its parameters are numbers (an argument of another type is an SQL
+   * error), so scriptc calls it directly, several times faster than a
+   * function(). Options: deterministic and directOnly. */
+  numberFunction(name: string, fn: NumberFunction, options?: { deterministic?: boolean; directOnly?: boolean }): void {
+    const db = this.#handle();
+    if (typeof name !== "string")
+      throw new SQLiteError('The "name" argument must be a string.', "ERR_INVALID_ARG_TYPE");
+    if (typeof fn !== "function")
+      throw new SQLiteError('The "function" argument must be a function.', "ERR_INVALID_ARG_TYPE");
+    const deterministic = options === undefined ? undefined : options.deterministic;
+    const directOnly = options === undefined ? undefined : options.directOnly;
+    checkBoolean("deterministic", deterministic);
+    checkBoolean("directOnly", directOnly);
+    const argc = functionLength(fn);
+    let flags = 0;
+    if (deterministic === true) flags |= SQLITE_DETERMINISTIC;
+    if (directOnly === true) flags |= SQLITE_DIRECTONLY;
+    ensureDispatch();
+    const id = ++nextFunctionId;
+    registered.set(id, {
+      bigints: false,
+      fn: null,
+      start: undefined,
+      inverse: null,
+      result: null,
+      num: fn,
+    });
+    const rc = sqxCreateFunction(db, name, argc, flags, id);
+    if (rc !== SQLITE_OK) throw sqliteError(db, rc);
+  }
+
   aggregate(name: string, options: AggregateOptions): void;
   aggregate(name: string, options: AnyAggregateOptions): void;
   aggregate(name: string, options: unknown): void {
@@ -912,6 +991,7 @@ export class DatabaseSync {
       start,
       inverse: inverse !== undefined ? (inverse as AnyCall) : null,
       result: typeof result === "function" ? (result as AnyCall) : null,
+      num: null,
     });
     const flags = o.directOnly === true ? SQLITE_DIRECTONLY : 0;
     const rc = sqxCreateAggregate(db, name, argc, flags, id, inverse !== undefined ? 1 : 0);
@@ -1197,6 +1277,48 @@ export class StatementSync {
     }
   }
 
+  /** Runs the statement `count` times, calling `bind(i, params)` before
+   * each run to set its values: `params.number(0, x)` sets the first
+   * anonymous parameter, as run(x) would. Values a run doesn't set are
+   * NULL. Returns the total of the runs' changes. Not in node:sqlite. The
+   * per-call work of run() (the statement pool, checks, the result
+   * object) happens once rather than per row. */
+  runMany(count: number, bind: (i: number, params: Parameters) => void): number {
+    const stmt = this.#start([]);
+    const params = new Parameters(stmt, this.#db._handle(), this.#anonymousIndexes(stmt), this.#paramCount, this.#db._liveness());
+    sqxClearBindings(stmt);
+    sqxTakeChanges();
+    try {
+      for (let i = 0; i < count; i++) {
+        bind(i, params);
+        this.#check();
+        const rc = sqxStepReset(stmt);
+        if (rc !== SQLITE_DONE) throw stepError(this.#db._handle(), rc);
+      }
+      return sqxTakeChanges();
+    } finally {
+      params._end();
+      sqxTakeChanges();
+      this.#db._release(this.#sql, stmt, this.#generation);
+    }
+  }
+
+  /** The indexes of the anonymous parameters, in order (see #bind). */
+  #anonymousIndexes(stmt: bigint): number[] {
+    let count = this.#paramCount;
+    if (count < 0) {
+      count = sqxParamCount(stmt);
+      this.#paramCount = count;
+    }
+    let anonymous = this.#anonymous;
+    if (anonymous === null) {
+      anonymous = [];
+      for (let index = 1; index <= count; index++) if (paramName(stmt, index).startsWith("?")) anonymous.push(index);
+      this.#anonymous = anonymous;
+    }
+    return anonymous;
+  }
+
   /** Between rows of map() and forEach(): as an iterator, they stop if the
    * database closed or this statement ran again meanwhile (Node's rule). */
   #afterRow(call: number): void {
@@ -1281,12 +1403,7 @@ export class StatementSync {
     // go to the indexes after the last parameter, where SQLite reports
     // the range error.
     if (first >= params.length) return;
-    let anonymous = this.#anonymous;
-    if (anonymous === null) {
-      anonymous = [];
-      for (let index = 1; index <= count; index++) if (paramName(stmt, index).startsWith("?")) anonymous.push(index);
-      this.#anonymous = anonymous;
-    }
+    const anonymous = this.#anonymousIndexes(stmt);
     for (let i = first; i < params.length; i++) {
       const k = i - first;
       this.#bindOne(stmt, k < anonymous.length ? anonymous[k]! : count + 1 + (k - anonymous.length), params[i]);
@@ -1589,5 +1706,70 @@ export class Columns {
     if (type === SQLITE_TEXT) return columnText(this.#stmt, i);
     if (type === SQLITE_BLOB) return columnBlob(this.#stmt, i);
     return null;
+  }
+}
+
+/** The values of one run of StatementSync.runMany(), set by position:
+ * index 0 is the first anonymous parameter, as in run(a, b, ...). Valid
+ * only inside the callback. */
+export class Parameters {
+  #stmt: bigint;
+  #db: bigint;
+  #anonymous: number[];
+  #count: number;
+  #liveness: Liveness;
+  #live = true;
+
+  /** @internal */
+  constructor(stmt: bigint, db: bigint, anonymous: number[], count: number, liveness: Liveness) {
+    this.#stmt = stmt;
+    this.#db = db;
+    this.#anonymous = anonymous;
+    this.#count = count;
+    this.#liveness = liveness;
+  }
+
+  /** @internal */
+  _end(): void {
+    this.#live = false;
+  }
+
+  /** SQLite's index for position i; past the anonymous parameters, the
+   * indexes after the last one, where binding fails as run() would. */
+  #index(i: number): number {
+    if (!this.#live) throw stateError("parameters are no longer available: set them inside the callback");
+    if (!this.#liveness.alive) throw finalizedError();
+    if ((i | 0) !== i || i < 0) throw new SQLiteError(`Parameter position ${i} is not valid`, "ERR_OUT_OF_RANGE");
+    const anonymous = this.#anonymous;
+    return i < anonymous.length ? anonymous[i]! : this.#count + 1 + (i - anonymous.length);
+  }
+
+  #done(rc: number): void {
+    if (rc !== SQLITE_OK) throw sqliteError(this.#db, rc);
+  }
+
+  /** Binds a number (as run() does: a REAL, which an INTEGER column stores
+   * as an integer when it is whole). */
+  number(i: number, value: number): void {
+    this.#done(sqxBindDouble(this.#stmt, this.#index(i), value));
+  }
+
+  text(i: number, value: string): void {
+    this.#done(sqxBindText(this.#stmt, this.#index(i), value));
+  }
+
+  blob(i: number, value: Uint8Array): void {
+    this.#done(sqxBindBlob(this.#stmt, this.#index(i), value));
+  }
+
+  bigint(i: number, value: bigint): void {
+    const index = this.#index(i);
+    if (value < INT64_MIN || value > INT64_MAX)
+      throw new SQLiteError("BigInt value is too large to bind.", "ERR_INVALID_ARG_VALUE");
+    this.#done(sqxBindInt64(this.#stmt, index, value));
+  }
+
+  null(i: number): void {
+    this.#done(sqxBindNull(this.#stmt, this.#index(i)));
   }
 }

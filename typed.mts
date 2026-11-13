@@ -133,6 +133,124 @@ const inserted = db.prepare("insert into t (n, body) values (?, ?) returning id,
 );
 console.log(`returning: ${inserted.join("")}`);
 
+// ── numberFunction ──────────────────────────────────────────────────────
+db.numberFunction("twice", (x) => x * 2, { deterministic: true });
+db.numberFunction("hyp", (a, b) => Math.sqrt(a * a + b * b));
+db.numberFunction("four", (a, b, c, d) => a * 1000 + b * 100 + c * 10 + d);
+db.numberFunction("answer", () => 42);
+db.numberFunction("nan", (x) => x * Number.NaN);
+attempt("numberFunction", () =>
+  db
+    .prepare("select twice(21) a, twice(0.25) b, hyp(3, 4) c, four(1, 2, 3, 4) d, answer() e, nan(1) f, typeof(twice(2)) g")
+    .map((c) => [0, 1, 2, 3, 4, 6].map((i) => String(c.value(i))).join(" ") + ` ${c.isNull(5)}`)
+    .join(""),
+);
+attempt("numberFunction over a table", () => String(db.prepare("select sum(twice(n)) from t where id < 3").map((c) => c.number(0))));
+attempt("numberFunction of text", () => String(db.prepare("select twice('x')").map((c) => String(c.value(0)))));
+attempt("numberFunction of null", () => String(db.prepare("select twice(null)").map((c) => String(c.value(0)))));
+attempt("numberFunction of a blob", () => String(db.prepare("select hyp(1, x'00')").map((c) => String(c.value(0)))));
+attempt("numberFunction beyond 2^53", () => String(db.prepare("select twice(9007199254740993)").map((c) => String(c.value(0)))));
+attempt("numberFunction, wrong argument count", () => String(db.prepare("select twice(1, 2)").map((c) => String(c.value(0)))));
+db.numberFunction("boom", (x) => {
+  if (x > 1) throw new Error("too big");
+  return x;
+});
+attempt("numberFunction that throws", () => String(db.prepare("select boom(n) from t order by id").map((c) => String(c.value(0)))));
+
+// ── runMany ─────────────────────────────────────────────────────────────
+db.exec("create table m (id integer primary key, n integer, r real, s text, b blob, big integer)");
+const add = db.prepare("insert into m (n, r, s, b, big) values (?, ?, ?, ?, ?)");
+const words = ["zero", "one ✓", "two 🙂"];
+attempt("runMany", () =>
+  String(
+    add.runMany(3, (i, p) => {
+      p.number(0, i);
+      p.number(1, i + 0.5);
+      p.text(2, words[i]!);
+      p.blob(3, new Uint8Array([i, 255]));
+      p.bigint(4, 9007199254740993n + BigInt(i));
+    }),
+  ),
+);
+attempt("runMany, values not set are NULL", () =>
+  String(
+    add.runMany(2, (i, p) => {
+      p.number(0, 10 + i);
+      if (i === 0) p.null(2);
+    }),
+  ),
+);
+attempt("rows written", () => {
+  const read = db.prepare("select id, n, r, s, hex(b), big, typeof(n) from m order by id");
+  read.setReadBigInts(true);
+  return read.map((c) => [0, 1, 2, 3, 4, 5, 6].map((i) => String(c.value(i))).join(",")).join(" | ");
+});
+attempt("runMany, zero rows", () => String(add.runMany(0, () => {})));
+attempt("runMany, position past the parameters", () =>
+  String(
+    add.runMany(1, (_, p) => {
+      p.number(5, 1);
+    }),
+  ),
+);
+attempt("runMany, negative position", () =>
+  String(
+    add.runMany(1, (_, p) => {
+      p.number(-1, 1);
+    }),
+  ),
+);
+attempt("runMany, bigint too large", () =>
+  String(
+    add.runMany(1, (_, p) => {
+      p.bigint(4, 2n ** 64n);
+    }),
+  ),
+);
+db.exec("create table u (k integer primary key)");
+const unique = db.prepare("insert into u (k) values (?)");
+attempt("runMany, a constraint fails on the third row", () =>
+  String(
+    unique.runMany(4, (i, p) => {
+      p.number(0, i === 2 ? 0 : i);
+    }),
+  ),
+);
+attempt("rows kept from before the failure", () => String(db.prepare("select k from u order by k").map((c) => c.number(0))));
+attempt("runMany, exception in the callback", () =>
+  String(
+    unique.runMany(3, (i, p) => {
+      if (i === 1) throw new Error("stop");
+      p.number(0, 100 + i);
+    }),
+  ),
+);
+attempt("statement usable after that", () => String(unique.run(500).changes));
+let keptParams: { number(i: number, v: number): void } | null = null;
+attempt("parameters after the call", () => {
+  unique.runMany(1, (_, p) => {
+    keptParams = p;
+    p.number(0, 600);
+  });
+  keptParams!.number(0, 1);
+  return "set";
+});
+const updateAll = db.prepare("update m set n = n + 1 where n >= ?");
+attempt("runMany, changes add up", () =>
+  String(
+    updateAll.runMany(2, (i, p) => {
+      p.number(0, i);
+    }),
+  ),
+);
+attempt("runMany with returning", () =>
+  String(
+    db.prepare("insert into u (k) values (?) returning k").runMany(2, (i, p) => {
+      p.number(0, 700 + i);
+    }),
+  ),
+);
+
 db.close();
 attempt("after close", () => String(db.prepare("select 1").map((c) => c.number(0))));
 console.log("done");

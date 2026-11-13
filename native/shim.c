@@ -146,6 +146,30 @@ int32_t sqx_reset(void *stmt) {
 /* SQLITE_ROW (100), SQLITE_DONE (101) or an error code. */
 int32_t sqx_step(void *stmt) { return sqlite3_step((sqlite3_stmt *)stmt); }
 
+/* StatementSync.runMany: steps a bound statement to the end (ignoring any
+ * rows it returns), resets it and clears its bindings for the next row, in
+ * one call. Returns the step's result code (SQLITE_DONE when it ran); the
+ * row's changes add up in a thread-local that sqx_take_changes returns. */
+static _Thread_local double many_changes;
+
+int32_t sqx_step_reset(void *stmt) {
+  sqlite3_stmt *s = (sqlite3_stmt *)stmt;
+  int rc = sqlite3_step(s);
+  while (rc == SQLITE_ROW) rc = sqlite3_step(s);
+  if (rc == SQLITE_DONE) many_changes += (double)sqlite3_changes64(sqlite3_db_handle(s));
+  sqlite3_reset(s);
+  sqlite3_clear_bindings(s);
+  return rc;
+}
+
+void sqx_clear_bindings(void *stmt) { sqlite3_clear_bindings((sqlite3_stmt *)stmt); }
+
+double sqx_take_changes(void) {
+  double n = many_changes;
+  many_changes = 0;
+  return n;
+}
+
 int64_t sqx_sql(void *stmt, uint8_t *out, size_t cap) {
   const char *s = sqlite3_sql((sqlite3_stmt *)stmt);
   return s ? copy_out(s, strlen(s), out, cap) : 0;
@@ -584,6 +608,19 @@ static sqlite3_value *arg(int32_t i) { return cur_argv[i]; }
 int32_t sqx_value_type(int32_t i) { return sqlite3_value_type(arg(i)); }
 int64_t sqx_value_int64(int32_t i) { return sqlite3_value_int64(arg(i)); }
 double sqx_value_double(int32_t i) { return sqlite3_value_double(arg(i)); }
+
+/* A number argument (INTEGER within ±(2^53 - 1), or REAL) as a double, in
+ * one call; NaN for anything else (SQLite never stores a NaN). For
+ * db.numberFunction. */
+double sqx_value_number(int32_t i) {
+  sqlite3_value *v = arg(i);
+  int type = sqlite3_value_type(v);
+  if (type == SQLITE_FLOAT) return sqlite3_value_double(v);
+  if (type != SQLITE_INTEGER) return NAN;
+  int64_t n = sqlite3_value_int64(v);
+  const int64_t max = 9007199254740991LL;
+  return n > max || n < -max ? NAN : (double)n;
+}
 
 /* An integer argument as a double when it is within ±(2^53 - 1), where
  * the two agree exactly; NaN otherwise (TypeScript then reads it as a

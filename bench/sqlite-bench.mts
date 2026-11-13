@@ -93,9 +93,10 @@ function udf(path: string): string {
   return `${row.s}`;
 }
 
-// The same reads through this package's typed reads (StatementSync.map and
-// forEach, not in node:sqlite): columns read by index with their types, no
-// row object. Run when a fifth argument says "typed".
+// The same workloads through this package's typed API (not in node:sqlite):
+// reads through StatementSync.map/forEach with columns read by index and
+// type, inserts through runMany, the function through numberFunction. Run
+// when a fifth argument says "typed".
 function startupTyped(path: string): string {
   const db = new DatabaseSync(path, { readOnly: true });
   const row = db
@@ -132,16 +133,44 @@ function textTyped(path: string): string {
   return `${sum.rows} ${sum.chars} ${sum.bytes} ${sum.check}`;
 }
 
+function insertTyped(path: string, n: number): string {
+  const db = new DatabaseSync(path);
+  db.exec("pragma journal_mode = wal; pragma synchronous = normal");
+  db.exec("create table t (id integer primary key, n integer, r real, body text)");
+  const add = db.prepare("insert into t (n, r, body) values (?, ?, ?)");
+  db.exec("begin");
+  add.runMany(n, (k, p) => {
+    const i = k + 1;
+    p.number(0, i);
+    p.number(1, i * 0.5);
+    p.text(2, body(i));
+  });
+  db.exec("commit");
+  const row = db
+    .prepare("select count(*) c, sum(n) s, sum(length(body)) l from t")
+    .map((c): CountRow => ({ c: c.number(0), s: c.number(1), l: c.number(2) }))[0]!;
+  db.close();
+  return `${row.c} ${row.s} ${row.l}`;
+}
+
+function udfTyped(path: string): string {
+  const db = new DatabaseSync(path, { readOnly: true });
+  db.numberFunction("twice", (x) => x * 2, { deterministic: true });
+  const s = db.prepare("select cast(sum(twice(n)) as integer) s from t").map((c) => c.number(0))[0]!;
+  db.close();
+  return `${s}`;
+}
+
 const workload = process.argv[2] ?? "";
 const path = process.argv[3] ?? "";
 const n = Number(process.argv[4] ?? "0");
 const typed = process.argv[5] === "typed";
 if (workload === "version") console.log(version(path));
 else if (workload === "startup") console.log(typed ? startupTyped(path) : startup(path));
-else if (workload === "insert") console.log(insert(path, n));
+else if (workload === "insert") console.log(typed ? insertTyped(path, n) : insert(path, n));
 else if (workload === "read") console.log(typed ? readTyped(path) : read(path));
 else if (workload === "text") console.log(typed ? textTyped(path) : text(path));
-else if (workload === "udf") console.log(udf(path));
+else if (workload === "udf") console.log(typed ? udfTyped(path) : udf(path));
 else {
   console.error(`unknown workload ${JSON.stringify(workload)}`);
   process.exit(2);

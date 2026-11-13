@@ -123,12 +123,12 @@ const impls = [
   },
   {
     id: "scriptc-typed",
-    label: "scriptc (typed reads)",
+    label: "scriptc (typed API)",
     available: () => found("clang"),
     missing: "clang",
     build: () => (existsSync(scriptcExe) ? null : "needs the scriptc build"),
     command: (w, db, n) => [scriptcExe, [w, db, String(n), "typed"], {}],
-    version: () => "same binary, map()/forEach() with typed column reads",
+    version: () => "same binary: map/forEach, runMany, numberFunction",
     size: () => null,
   },
   {

@@ -6,7 +6,7 @@ The same SQLite workloads in eight forms, so the scriptc build can be compared w
 |---|---|---|
 | scriptc | `sqlite-bench.mts`, compiled with `bin/scriptc-sqlite.mjs` | compiled in by `build.sh` |
 | scriptc (packed reads) | the same binary with `SCRIPTC_SQLITE_ROW_READS=packed` (one FFI call per row that copies the whole row into a buffer; measured slower than the default per-value reads) | same |
-| scriptc (typed reads) | the same binary with a `typed` argument: `startup`, `read` and `text` read through `map()`/`forEach()` and typed column getters instead of row objects (this package's extension, not in `node:sqlite`); `insert` and `udf` are the same as `scriptc` | same |
+| scriptc (typed API) | the same binary with a `typed` argument: reads through `map()`/`forEach()` and typed column getters instead of row objects, `insert` through `runMany()`, `udf` through `numberFunction()` (this package's extensions, not in `node:sqlite`) | same |
 | Node | `sqlite-bench.mts` under Node 24 (`node:sqlite`) | bundled with Node |
 | Deno | `sqlite-bench.mts` under Deno 2 (`node:sqlite`, through the package's `#sqlite` import) | bundled with Deno |
 | Bun | `bun-bench.ts` (`bun:sqlite`) | bundled on Linux; **the system's SQLite on macOS** |

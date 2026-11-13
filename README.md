@@ -104,6 +104,27 @@ db.prepare("select body from notes").forEach((row) => {
 - **Why it's faster:** `all()` and `iterate()` build a dynamic object per row, and `row as Note` then makes scriptc check every field at run time. Here the callback returns an object literal of a declared type, which scriptc builds natively. Reading a million rows takes about a third of the time of `iterate()` (the benchmark's "typed reads" row).
 - **Under Node:** this repository's test programs import `#sqlite`, which under Node is `node:sqlite` with these two methods added (`src/node-sqlite.ts`), so the same program runs in both. `typed.mts` checks that the two agree byte for byte.
 
+## Fast writes and number functions
+
+Two more methods for hot paths, also not in `node:sqlite`:
+
+```ts
+const add = db.prepare("insert into points (x, y, label) values (?, ?, ?)");
+db.exec("begin");
+const changes = add.runMany(points.length, (i, p) => {
+  p.number(0, points[i].x);
+  p.number(1, points[i].y);
+  p.text(2, points[i].label);
+});
+db.exec("commit");
+
+db.numberFunction("hypot", (a, b) => Math.sqrt(a * a + b * b), { deterministic: true });
+```
+
+- **`stmt.runMany(count, bind)`** runs the statement `count` times. Before each run, `bind(i, p)` sets its values by position, as `run(a, b, …)` would: `p.number(0, a)`, `p.text(1, b)`, and `p.blob`, `p.bigint` and `p.null`. Values a run doesn't set are NULL, rows a statement returns are ignored, and it returns the total of the runs' changes. If a run fails, it throws, and the runs before it stay done (inside your transaction). It's about a third faster than calling `run()` in a loop, because the per-call work happens once.
+- **`db.numberFunction(name, fn, options?)`** registers a SQL function of up to four numbers that returns a number. Its parameters are numbers, not `SQLOutputValue`s, so scriptc calls it directly: almost twice as fast as the same `db.function`. An argument that isn't a number is an SQL error (`ERR_INVALID_ARG_TYPE`), integers beyond ±(2^53 − 1) throw `ERR_OUT_OF_RANGE`, and a NaN result is NULL. Options: `deterministic`, `directOnly`.
+- **Under Node** both are added the same way as `map` and `forEach`, and `typed.mts` checks them against Node byte for byte.
+
 ## SQL functions
 
 ```ts
