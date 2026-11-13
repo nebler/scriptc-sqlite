@@ -93,14 +93,54 @@ function udf(path: string): string {
   return `${row.s}`;
 }
 
+// The same reads through this package's typed reads (StatementSync.map and
+// forEach, not in node:sqlite): columns read by index with their types, no
+// row object. Run when a fifth argument says "typed".
+function startupTyped(path: string): string {
+  const db = new DatabaseSync(path, { readOnly: true });
+  const row = db
+    .prepare("select count(*) c, sum(length(body)) s, 0 l from notes where id <= 100")
+    .map((c): CountRow => ({ c: c.number(0), s: c.number(1), l: c.number(2) }))[0]!;
+  db.close();
+  return `${row.c} ${row.s}`;
+}
+
+function readTyped(path: string): string {
+  const db = new DatabaseSync(path, { readOnly: true });
+  const sum = { rows: 0, n: 0, r: 0, chars: 0 };
+  db.prepare("select n, r, body from t").forEach((c) => {
+    sum.rows++;
+    sum.n += c.number(0);
+    sum.r += c.number(1);
+    sum.chars += c.text(2).length;
+  });
+  db.close();
+  return `${sum.rows} ${sum.n} ${sum.r * 2} ${sum.chars}`;
+}
+
+function textTyped(path: string): string {
+  const db = new DatabaseSync(path, { readOnly: true });
+  const sum = { rows: 0, chars: 0, bytes: 0, check: 0 };
+  db.prepare("select body, data from t2").forEach((c) => {
+    const d = c.blob(1);
+    sum.rows++;
+    sum.chars += c.text(0).length;
+    sum.bytes += d.length;
+    sum.check += d[0]! + d[d.length >> 1]! + d[d.length - 1]!;
+  });
+  db.close();
+  return `${sum.rows} ${sum.chars} ${sum.bytes} ${sum.check}`;
+}
+
 const workload = process.argv[2] ?? "";
 const path = process.argv[3] ?? "";
 const n = Number(process.argv[4] ?? "0");
+const typed = process.argv[5] === "typed";
 if (workload === "version") console.log(version(path));
-else if (workload === "startup") console.log(startup(path));
+else if (workload === "startup") console.log(typed ? startupTyped(path) : startup(path));
 else if (workload === "insert") console.log(insert(path, n));
-else if (workload === "read") console.log(read(path));
-else if (workload === "text") console.log(text(path));
+else if (workload === "read") console.log(typed ? readTyped(path) : read(path));
+else if (workload === "text") console.log(typed ? textTyped(path) : text(path));
 else if (workload === "udf") console.log(udf(path));
 else {
   console.error(`unknown workload ${JSON.stringify(workload)}`);

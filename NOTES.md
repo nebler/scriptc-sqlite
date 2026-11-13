@@ -2,6 +2,16 @@
 
 Uses the published `scriptc@0.4.12` from npm. Days 1 and 2 were built and checked in a Linux arm64 sandbox (gVisor); macOS arm64 was checked afterwards. Day 3 ran in a different Linux arm64 sandbox, with Zig as the C toolchain.
 
+## Day 5, continued: typed reads
+
+**`StatementSync.map()` and `forEach()` with a typed column reader** (README, "Fast typed reads"). With Node's API, most of a read is building a dynamic row object and the caller's `row as T` check (about 1.3 µs a row here, against 0.17 µs for SQLite itself). Reading columns by index into an object literal of a declared type skips both.
+
+- **Read 1M rows on the Linux arm64 host:** 490 ms typed against 1746 ms through `iterate()`; text 254 against 410 ms. A prototype without any checks took 445 ms, so the checks cost about 10%.
+- **Checks kept:** each read checks the column's type in the same C call that reads it (NaN or −1 back on a mismatch, then a second call to name the type); the row checks a liveness token that `close()` and `deserialize()` invalidate, so a reader can never touch a finalized statement; the statement checks between rows that it wasn't run again (Node's "iterator was invalidated").
+- **Under Node** `src/node-sqlite.ts` adds the same methods over `iterate()` with array rows. `typed.mts` compares the two byte for byte, release and sanitized.
+- **What's left in a typed read:** about 30% SQLite, about 20% scriptc working out `.length` of non-ASCII text (the caller's code; Go and Rust count characters too), the rest FFI calls and string decoding.
+- **SQLite's own build flags** (`-O3` against `-O2`): about 2%, within noise; left at `-O2`.
+
 ## Day 5, 13 November 2026: performance
 
 **Every workload got faster, none slower; outputs still identical to Node.** Profiled with `perf` on a quiet Linux arm64 host (4 Neoverse-N1 cores, outside any sandbox), each change timed alone (median of 5 to 7 whole-process runs, min within 2% of the median) and kept only if it helped. The box timings rule still holds: none of these numbers come from a sandbox.

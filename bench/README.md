@@ -6,6 +6,7 @@ The same SQLite workloads in seven forms, so the scriptc build can be compared w
 |---|---|---|
 | scriptc | `sqlite-bench.mts`, compiled with `bin/scriptc-sqlite.mjs` | compiled in by `build.sh` |
 | scriptc (packed reads) | the same binary with `SCRIPTC_SQLITE_ROW_READS=packed` (one FFI call per row that copies the whole row into a buffer; measured slower than the default per-value reads) | same |
+| scriptc (typed reads) | the same binary with a `typed` argument: `startup`, `read` and `text` read through `map()`/`forEach()` and typed column getters instead of row objects (this package's extension, not in `node:sqlite`); `insert` and `udf` are the same as `scriptc` | same |
 | Node | `sqlite-bench.mts` under Node 24 (`node:sqlite`) | bundled with Node |
 | Deno | `sqlite-bench.mts` under Deno 2 (`node:sqlite`, through the package's `#sqlite` import) | bundled with Deno |
 | Bun | `bun-bench.ts` (`bun:sqlite`) | bundled on Linux; **the system's SQLite on macOS** |
@@ -37,7 +38,7 @@ $ node bench/run.mjs --n=read=200000     # change N per workload
 $ node bench/run.mjs --check             # small N, one run each, checksums only, no timings
 ```
 
-Results go to `bench/results/<platform>.json` (every run) and `<platform>.md` (the tables). Implementation ids for `--only`: `scriptc`, `scriptc-packed`, `node`, `deno`, `bun`, `go`, `rust`.
+Results go to `bench/results/<platform>.json` (every run) and `<platform>.md` (the tables). Implementation ids for `--only`: `scriptc`, `scriptc-packed`, `scriptc-typed`, `node`, `deno`, `bun`, `go`, `rust`.
 
 In CI: Actions → Benchmark → Run workflow (`.github/workflows/bench.yml`). It runs `--check`, then the benchmark, on Linux x64, Linux arm64 and macOS arm64. The tables land in the job summary and `bench/results/` is uploaded as an artifact.
 

@@ -121,6 +121,16 @@ const impls = [
     size: () => null,
   },
   {
+    id: "scriptc-typed",
+    label: "scriptc (typed reads)",
+    available: () => found("clang"),
+    missing: "clang",
+    build: () => (existsSync(scriptcExe) ? null : "needs the scriptc build"),
+    command: (w, db, n) => [scriptcExe, [w, db, String(n), "typed"], {}],
+    version: () => "same binary, map()/forEach() with typed column reads",
+    size: () => null,
+  },
+  {
     id: "node",
     label: "Node (node:sqlite)",
     available: () => true,
@@ -250,7 +260,7 @@ for (const impl of impls) {
     notes.push(`${impl.label}: skipped, ${impl.missing} not found`);
     continue;
   }
-  if (flag("no-build") === undefined || impl.id === "scriptc-packed") {
+  if (flag("no-build") === undefined || impl.id === "scriptc-packed" || impl.id === "scriptc-typed") {
     process.stderr.write(`building ${impl.label}\n`);
     const error = impl.build();
     if (error !== null) {

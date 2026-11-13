@@ -222,6 +222,39 @@ int32_t sqx_column_type(void *stmt, int32_t i) { return sqlite3_column_type((sql
 
 int64_t sqx_column_int64(void *stmt, int32_t i) { return sqlite3_column_int64((sqlite3_stmt *)stmt, i); }
 
+/* Typed reads (StatementSync.map/forEach): one call per value, which also
+ * checks the column's type. A number column (INTEGER within ±(2^53 - 1),
+ * or REAL) as a double; NaN for anything else, after which TypeScript
+ * asks for the type to say what went wrong (SQLite never stores a NaN:
+ * it becomes NULL). */
+double sqx_column_number(void *stmt, int32_t i) {
+  sqlite3_stmt *s = (sqlite3_stmt *)stmt;
+  int type = sqlite3_column_type(s, i);
+  if (type == SQLITE_FLOAT) return sqlite3_column_double(s, i);
+  if (type != SQLITE_INTEGER) return NAN;
+  int64_t v = sqlite3_column_int64(s, i);
+  const int64_t max = 9007199254740991LL;
+  return v > max || v < -max ? NAN : (double)v;
+}
+
+/* A TEXT column copied as for sqx_column_text; -1 if the column is not
+ * TEXT (nothing converted). Likewise for BLOB. */
+double sqx_column_text_typed(void *stmt, int32_t i, uint8_t *out, size_t cap) {
+  sqlite3_stmt *s = (sqlite3_stmt *)stmt;
+  if (sqlite3_column_type(s, i) != SQLITE_TEXT) return -1;
+  const unsigned char *t = sqlite3_column_text(s, i);
+  size_t n = (size_t)sqlite3_column_bytes(s, i);
+  return t ? (double)copy_out(t, n, out, cap) : 0;
+}
+
+double sqx_column_blob_typed(void *stmt, int32_t i, uint8_t *out, size_t cap) {
+  sqlite3_stmt *s = (sqlite3_stmt *)stmt;
+  if (sqlite3_column_type(s, i) != SQLITE_BLOB) return -1;
+  const void *b = sqlite3_column_blob(s, i);
+  size_t n = (size_t)sqlite3_column_bytes(s, i);
+  return b ? (double)copy_out(b, n, out, cap) : 0;
+}
+
 /* An integer column as a double within ±(2^53 - 1), NaN outside (as
  * sqx_value_safe_int): no bigint to allocate per value. */
 double sqx_column_safe_int(void *stmt, int32_t i) {

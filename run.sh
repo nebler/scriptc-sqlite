@@ -41,7 +41,7 @@ compare() {
   note "$name $lane: exit $code, output $same to Node, other stderr lines $extra, $(grep '^peak-rss-kib' build/$name-$lane.err)"
 }
 
-for name in test threads udf-threads query migrate small; do
+for name in test typed threads udf-threads query migrate small; do
   build/bin/peakrss node $name.mts > build/$name-node.out 2> build/$name-node.err
   echo "building $name"
   $cli build $name.mts -o build/bin/$name > build/$name.build 2>&1
@@ -53,7 +53,7 @@ done
 SCRIPTC_SQLITE_ROW_READS=packed build/bin/test > build/test-packed.out 2>&1 || status=1
 if cmp -s build/test-node.out build/test-packed.out; then note "test release, packed reads: identical to Node"; else note "test release, packed reads: DIFFERENT"; status=1; fi
 if [ "$sanitize" = 1 ]; then
-  for name in test threads udf-threads query migrate; do
+  for name in test typed threads udf-threads query migrate; do
     echo "building $name, sanitized"
     $cli build $name.mts --sanitize -o build/bin/$name-san > build/$name-san.build 2>&1
     compare $name sanitized
@@ -122,7 +122,7 @@ if [ "$got" = "added 1|added 2|done 1|[x] 1  first|[ ] 2  second|" ]; then note 
 
 # The benchmark programs agree with each other (no timings: --check).
 echo "checking the benchmark programs"
-if node bench/run.mjs --check --only=scriptc,scriptc-packed,node > build/bench-check.out 2>&1; then note "benchmark programs: checksums agree (scriptc, packed reads, node)"; else note "benchmark programs: CHECKSUMS DIFFER (see build/bench-check.out)"; status=1; fi
+if node bench/run.mjs --check --only=scriptc,scriptc-packed,scriptc-typed,node > build/bench-check.out 2>&1; then note "benchmark programs: checksums agree (scriptc, packed reads, typed reads, node)"; else note "benchmark programs: CHECKSUMS DIFFER (see build/bench-check.out)"; status=1; fi
 
 size() { wc -c < "$1" | tr -d ' '; }
 cp build/bin/test build/bin/test-stripped

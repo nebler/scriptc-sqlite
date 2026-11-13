@@ -81,6 +81,29 @@ For the reasons, and for how this was checked against Node, see `NOTES.md`.
 
 Read a row by casting it to a `type`, as above. TypeScript refuses the same cast to an `interface`.
 
+## Fast typed reads
+
+Two methods that `node:sqlite` doesn't have read rows without building a row object:
+
+```ts
+type Note = { id: number; title: string; tag: string | null };
+
+const notes = db.prepare("select id, title, tag from notes where id > ?").map(
+  (row): Note => ({ id: row.number(0), title: row.text(1), tag: row.isNull(2) ? null : row.text(2) }),
+  10,
+);
+
+let words = 0;
+db.prepare("select body from notes").forEach((row) => {
+  words += row.text(0).split(" ").length;
+});
+```
+
+- **`map(read, ...params)`** returns `read(row)` for each row; **`forEach(fn, ...params)`** only calls `fn(row)`. Parameters work as for `all()`.
+- **The row** reads a column by index: `number(i)` (INTEGER or REAL), `text(i)`, `blob(i)`, `isNull(i)`, `value(i)` (as `all()` would give it), and `length`. A column of another type throws `ERR_SQLITE_COLUMN_TYPE`; nothing is converted silently. Integers beyond ±(2^53 − 1) throw `ERR_OUT_OF_RANGE`, as in Node. The row is only valid inside the callback.
+- **Why it's faster:** `all()` and `iterate()` build a dynamic object per row, and `row as Note` then makes scriptc check every field at run time. Here the callback returns an object literal of a declared type, which scriptc builds natively. Reading a million rows takes about a third of the time of `iterate()` (the benchmark's "typed reads" row).
+- **Under Node:** this repository's test programs import `#sqlite`, which under Node is `node:sqlite` with these two methods added (`src/node-sqlite.ts`), so the same program runs in both. `typed.mts` checks that the two agree byte for byte.
+
 ## SQL functions
 
 ```ts

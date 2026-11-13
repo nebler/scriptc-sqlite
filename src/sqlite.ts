@@ -46,6 +46,9 @@ declare function sqxColumnOrigin(stmt: bigint, index: number, which: number, out
 declare function sqxColumnType(stmt: bigint, index: number): number;
 declare function sqxColumnInt64(stmt: bigint, index: number): bigint;
 declare function sqxColumnSafeInt(stmt: bigint, index: number): number;
+declare function sqxColumnNumber(stmt: bigint, index: number): number;
+declare function sqxColumnTextTyped(stmt: bigint, index: number, out: Uint8Array): number;
+declare function sqxColumnBlobTyped(stmt: bigint, index: number, out: Uint8Array): number;
 declare function sqxColumnDouble(stmt: bigint, index: number): number;
 declare function sqxColumnText(stmt: bigint, index: number, out: Uint8Array): number;
 declare function sqxColumnBlob(stmt: bigint, index: number, out: Uint8Array): number;
@@ -96,6 +99,9 @@ declare function sqxResultError(message: string): void;
 export type SQLInputValue = null | number | bigint | string | Uint8Array | boolean;
 export type SQLOutputValue = null | number | bigint | string | Uint8Array;
 export type SQLRow = Record<string, SQLOutputValue>;
+/** What map() and forEach() take after the callback: values for anonymous
+ * parameters, optionally after one object of named ones. */
+export type SQLParameters = SQLInputValue | Record<string, SQLInputValue>;
 
 export interface StatementResultingChanges {
   changes: number | bigint;
@@ -189,6 +195,7 @@ const SQLITE_INTEGER = 1;
 const SQLITE_FLOAT = 2;
 const SQLITE_TEXT = 3;
 const SQLITE_BLOB = 4;
+const SQLITE_NULL = 5;
 const NULL_HANDLE = 0n;
 const INT64_MIN = -(2n ** 63n);
 const INT64_MAX = 2n ** 63n - 1n;
@@ -670,6 +677,13 @@ interface StatementSettings {
   allowUnknownNamedParameters: boolean;
 }
 
+/** Whether a database's statements are still valid: close() and
+ * deserialize() finalize them and replace the token, so a column reader
+ * checks one field instead of calling into the database per read. */
+class Liveness {
+  alive = true;
+}
+
 export class DatabaseSync {
   #path: string;
   #readOnly: boolean;
@@ -698,6 +712,7 @@ export class DatabaseSync {
   // in C: extensions such as FTS5 keep statements of their own on the
   // connection and finalize those themselves.)
   #lent: bigint[] = [];
+  #liveness = new Liveness();
 
   constructor(path: string, options?: DatabaseSyncOptions) {
     if (typeof path !== "string")
@@ -792,6 +807,8 @@ export class DatabaseSync {
   }
 
   #finalizeAll(): void {
+    this.#liveness.alive = false;
+    this.#liveness = new Liveness();
     if (this.#hotStmt !== NULL_HANDLE) sqxFinalize(this.#hotStmt);
     for (const handles of this.#pool.values()) for (const stmt of handles) sqxFinalize(stmt);
     for (const stmt of this.#lent) sqxFinalize(stmt);
@@ -920,6 +937,11 @@ export class DatabaseSync {
   _handleFor(generation: number): bigint {
     if (this.#db === NULL_HANDLE || generation !== this.#generation) throw finalizedError();
     return this.#db;
+  }
+
+  /** @internal The token that close() and deserialize() invalidate. */
+  _liveness(): Liveness {
+    return this.#liveness;
   }
 
   /** @internal Throws as _handleFor does, without returning the handle
@@ -1126,6 +1148,60 @@ export class StatementSync {
     } finally {
       this.#db._release(this.#sql, stmt, this.#generation);
     }
+  }
+
+  /** Runs the statement and returns `read(row)` for every row it gives,
+   * reading columns by index with their types (`row.number(0)`,
+   * `row.text(1)`, ...). Not in node:sqlite. No row object is built, so
+   * returning an object literal of a declared type is far faster than
+   * all() and a cast: the compiler knows its shape. `row` is only valid
+   * inside the call. */
+  map<T>(read: (row: Columns) => T, ...params: SQLParameters[]): T[] {
+    const out: T[] = [];
+    const stmt = this.#start(params as unknown[]);
+    const call = this.#calls;
+    const row = new Columns(stmt, this.#db._liveness(), this.#settings.readBigInts);
+    try {
+      let rc = sqxStep(stmt);
+      if (rc === SQLITE_ROW) row._ready(sqxColumnCount(stmt));
+      while (rc === SQLITE_ROW) {
+        out.push(read(row));
+        this.#afterRow(call);
+        rc = sqxStep(stmt);
+      }
+      if (rc !== SQLITE_DONE) throw stepError(this.#db._handle(), rc);
+      return out;
+    } finally {
+      row._end();
+      this.#db._release(this.#sql, stmt, this.#generation);
+    }
+  }
+
+  /** Like map(), but only calls `fn(row)` for every row. */
+  forEach(fn: (row: Columns) => void, ...params: SQLParameters[]): void {
+    const stmt = this.#start(params as unknown[]);
+    const call = this.#calls;
+    const row = new Columns(stmt, this.#db._liveness(), this.#settings.readBigInts);
+    try {
+      let rc = sqxStep(stmt);
+      if (rc === SQLITE_ROW) row._ready(sqxColumnCount(stmt));
+      while (rc === SQLITE_ROW) {
+        fn(row);
+        this.#afterRow(call);
+        rc = sqxStep(stmt);
+      }
+      if (rc !== SQLITE_DONE) throw stepError(this.#db._handle(), rc);
+    } finally {
+      row._end();
+      this.#db._release(this.#sql, stmt, this.#generation);
+    }
+  }
+
+  /** Between rows of map() and forEach(): as an iterator, they stop if the
+   * database closed or this statement ran again meanwhile (Node's rule). */
+  #afterRow(call: number): void {
+    this.#check();
+    if (call !== this.#calls) throw stateError("iterator was invalidated");
   }
 
   iterate(...params: unknown[]): StatementIterator {
@@ -1399,5 +1475,119 @@ export class StatementIterator implements IterableIterator<SQLRow> {
     if (this.#done) return;
     this.#done = true;
     this.#statement._finish(this.#stmt);
+  }
+}
+
+/** The kind of value a column holds, for column type errors: Node gives
+ * the same JavaScript value for INTEGER and REAL, so both are "a number". */
+function columnKind(type: number): string {
+  if (type === SQLITE_INTEGER || type === SQLITE_FLOAT) return "a number";
+  if (type === SQLITE_TEXT) return "text";
+  if (type === SQLITE_BLOB) return "a blob";
+  return "null";
+}
+
+function columnTypeError(i: number, type: number, wanted: string): SQLiteError {
+  return new SQLiteError(`Column ${i} holds ${columnKind(type)}, not ${wanted}`, "ERR_SQLITE_COLUMN_TYPE");
+}
+
+/** The current row of StatementSync.map() or forEach(), read by column
+ * index. Each read checks the column's type and throws
+ * ERR_SQLITE_COLUMN_TYPE when it does not match (no silent conversion);
+ * columns that are not read are never converted. Valid only inside the
+ * callback. */
+export class Columns {
+  #stmt: bigint;
+  #liveness: Liveness;
+  #bigints: boolean;
+  #count = 0;
+  #live = true;
+
+  /** @internal */
+  constructor(stmt: bigint, liveness: Liveness, bigints: boolean) {
+    this.#stmt = stmt;
+    this.#liveness = liveness;
+    this.#bigints = bigints;
+  }
+
+  /** @internal The first row arrived: its column count is now known. */
+  _ready(count: number): void {
+    this.#count = count;
+  }
+
+  /** @internal The rows are done; later reads throw. */
+  _end(): void {
+    this.#live = false;
+  }
+
+  /** The number of columns. */
+  get length(): number {
+    this.#alive();
+    return this.#count;
+  }
+
+  #alive(): void {
+    if (!this.#live) throw stateError("row is no longer available: read columns inside the callback");
+    if (!this.#liveness.alive) throw finalizedError();
+  }
+
+  /** Throws unless the row can be read and i is one of its columns. */
+  #check(i: number): void {
+    this.#alive();
+    if ((i | 0) !== i || i < 0 || i >= this.#count)
+      throw new SQLiteError(`Column index ${i} is out of range: the row has ${this.#count} columns`, "ERR_OUT_OF_RANGE");
+  }
+
+  /** An INTEGER or REAL column as a number. Integers beyond ±(2^53 - 1)
+   * throw ERR_OUT_OF_RANGE, as node:sqlite does. */
+  number(i: number): number {
+    this.#check(i);
+    const value = sqxColumnNumber(this.#stmt, i);
+    if (value === value) return value;
+    const type = sqxColumnType(this.#stmt, i);
+    if (type !== SQLITE_INTEGER) throw columnTypeError(i, type, "a number");
+    const big = sqxColumnInt64(this.#stmt, i);
+    throw new SQLiteError(`Value is too large to be represented as a JavaScript number: ${big}`, "ERR_OUT_OF_RANGE");
+  }
+
+  /** A TEXT column as a string. */
+  text(i: number): string {
+    this.#check(i);
+    let n = sqxColumnTextTyped(this.#stmt, i, scratch);
+    if (n < 0) throw columnTypeError(i, sqxColumnType(this.#stmt, i), "text");
+    if (n > scratch.length) {
+      scratch = new Uint8Array(Math.max(n, scratch.length * 2));
+      n = sqxColumnTextTyped(this.#stmt, i, scratch);
+    }
+    return n === 0 ? "" : utf8(scratch.subarray(0, n));
+  }
+
+  /** A BLOB column as a new Uint8Array. */
+  blob(i: number): Uint8Array {
+    this.#check(i);
+    let n = sqxColumnBlobTyped(this.#stmt, i, scratch);
+    if (n < 0) throw columnTypeError(i, sqxColumnType(this.#stmt, i), "a blob");
+    if (n > scratch.length) {
+      scratch = new Uint8Array(Math.max(n, scratch.length * 2));
+      n = sqxColumnBlobTyped(this.#stmt, i, scratch);
+    }
+    return n === 0 ? new Uint8Array(0) : scratch.slice(0, n);
+  }
+
+  /** Whether column i is NULL. */
+  isNull(i: number): boolean {
+    this.#check(i);
+    return sqxColumnType(this.#stmt, i) === SQLITE_NULL;
+  }
+
+  /** Column i as all() would give it (respecting readBigInts). */
+  value(i: number): SQLOutputValue {
+    this.#check(i);
+    const type = sqxColumnType(this.#stmt, i);
+    if (type === SQLITE_INTEGER) return this.#bigints ? sqxColumnInt64(this.#stmt, i) : this.number(i);
+    if (type === SQLITE_FLOAT) return sqxColumnDouble(this.#stmt, i);
+    if (type === SQLITE_TEXT) return columnText(this.#stmt, i);
+    if (type === SQLITE_BLOB) return columnBlob(this.#stmt, i);
+    return null;
   }
 }
