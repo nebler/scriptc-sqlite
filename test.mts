@@ -253,6 +253,210 @@ attempt("commit without begin", () => {
   return "committed";
 });
 
+// ── day 2: iterate, arrays, columns, expanded SQL, options, disposal ─────
+{
+  const d = new DatabaseSync(":memory:");
+  d.exec("create table pets (id integer primary key, name text not null, kind text, born integer, weight real)");
+  const add = d.prepare("insert into pets (name, kind, born, weight) values (?, ?, ?, ?)");
+  const pets: [string, string | null, bigint, number][] = [
+    ["Mia", "cat", 2019n, 4.25],
+    ["Bo", "dog", 2016n, 21.5],
+    ["Ünal", null, 2021n, 0.03],
+    ["Kiki", "parrot", 2000n, 0.4],
+  ];
+  for (const [name, kind, born, weight] of pets) add.run(name, kind, born, weight);
+
+  const byAge = d.prepare("select name, born from pets order by born");
+  attempt("null prototype", () => String(Object.getPrototypeOf(byAge.get()) === null));
+  attempt("iterate", () => {
+    const names: string[] = [];
+    for (const row of byAge.iterate()) names.push(show((row as Record<string, Value>)["name"]));
+    return names.join(" ");
+  });
+  attempt("iterate with parameters", () => {
+    const it = d.prepare("select name from pets where born > ? order by id").iterate(2017n);
+    const first = it.next();
+    const second = it.next();
+    const third = it.next();
+    return `${first.done} ${showRow(first.value as Record<string, Value>)} ${second.done} ${third.done} ${JSON.stringify(third.value)}`;
+  });
+  attempt("iterator is iterable", () => {
+    const it = byAge.iterate();
+    return `${it[Symbol.iterator]() === it}`;
+  });
+  attempt("iterate then return", () => {
+    const it = byAge.iterate();
+    it.next();
+    return `${JSON.stringify(it.return!())} then ${JSON.stringify(it.next())}`;
+  });
+  attempt("break out of iterate, then reuse", () => {
+    let seen = 0;
+    for (const row of byAge.iterate()) {
+      seen++;
+      if (seen === 2) break;
+      show((row as Record<string, Value>)["name"]);
+    }
+    return `${seen} seen, then ${byAge.all().length} rows`;
+  });
+  attempt("call during iterate", () => {
+    const it = byAge.iterate();
+    it.next();
+    byAge.get();
+    return JSON.stringify(it.next());
+  });
+  attempt("spread iterate", () => `${[...byAge.iterate()].length} rows`);
+  attempt("empty iterate", () => JSON.stringify(d.prepare("select 1 where 0").iterate().next()));
+
+  // Node's returnArrays is left out of the scriptc module (see NOTES.md), so
+  // it is not compared here.
+
+  attempt("columns", () =>
+    JSON.stringify(d.prepare("select p.id, name as n, born + 1 as next, 'x' lit, weight from pets p").columns()),
+  );
+  attempt("columns of no-result statement", () => JSON.stringify(add.columns()));
+
+  attempt("expandedSQL unbound", () => d.prepare("select ? a, $b b, :c c").expandedSQL);
+  attempt("expandedSQL bound", () => {
+    const s = d.prepare("select ? a, ? b, ? c, ? d, ? e");
+    s.get(1, "it's", 2n, null, new Uint8Array([0xab, 0xcd]));
+    return s.expandedSQL;
+  });
+
+  attempt("bare names off", () => {
+    const s = d.prepare("select $a a");
+    s.setAllowBareNamedParameters(false);
+    return showRow(s.get({ a: 1 }) as Record<string, Value>);
+  });
+  attempt("bare names off, prefixed key", () => {
+    const s = d.prepare("select $a a");
+    s.setAllowBareNamedParameters(false);
+    return showRow(s.get({ $a: 1 }) as Record<string, Value>);
+  });
+  attempt("unknown names allowed", () => {
+    const s = d.prepare("select $a a");
+    s.setAllowUnknownNamedParameters(true);
+    return showRow(s.get({ a: 1, extra: 2 }) as Record<string, Value>);
+  });
+  attempt("options for named parameters", () => {
+    const a = new DatabaseSync(":memory:", { allowBareNamedParameters: false });
+    try {
+      return showRow(a.prepare("select :x x").get({ x: 1 }) as Record<string, Value>);
+    } finally {
+      a.close();
+    }
+  });
+
+  attempt("foreign keys off", () => {
+    const a = new DatabaseSync(":memory:", { enableForeignKeyConstraints: false });
+    a.exec("create table p (id integer primary key); create table c (p integer references p(id)); insert into c values (5)");
+    a.close();
+    return "inserted";
+  });
+  attempt("double-quoted strings on", () => {
+    const a = new DatabaseSync(":memory:", { enableDoubleQuotedStringLiterals: true });
+    const row = a.prepare('select "lit" x').get() as Record<string, Value>;
+    a.close();
+    return showRow(row);
+  });
+  attempt("timeout option", () => {
+    const a = new DatabaseSync(":memory:", { timeout: 250 });
+    a.close();
+    return "ok";
+  });
+  attempt("bad timeout", () => {
+    new DatabaseSync(":memory:", { timeout: 1.5 });
+    return "accepted";
+  });
+  // A wrongly typed boolean option ({ readOnly: "yes" as unknown as boolean })
+  // is not compared: scriptc's own run-time type check stops the string
+  // before the module sees it, with scriptc's message (see NOTES.md).
+  attempt("read-only", () => {
+    const a = new DatabaseSync(":memory:", { readOnly: true });
+    try {
+      a.exec("create table t (x)");
+      return "created";
+    } finally {
+      a.close();
+    }
+  });
+
+  attempt("statement close", () => {
+    const s = d.prepare("select 1 x");
+    s.close();
+    return showRow(s.get() as Record<string, Value>);
+  });
+  attempt("statement close twice", () => {
+    const s = d.prepare("select 1 x");
+    s.close();
+    s.close();
+    return "closed twice";
+  });
+  attempt("statement dispose twice", () => {
+    const s = d.prepare("select 1 x");
+    s[Symbol.dispose]();
+    s[Symbol.dispose]();
+    return "ok";
+  });
+  attempt("using", () => {
+    let kept: { get(): unknown } | null = null;
+    {
+      using s = d.prepare("select 'inside' x");
+      kept = s;
+      show((s.get() as Record<string, Value>)["x"]);
+    }
+    try {
+      kept.get();
+      return "still usable";
+    } catch (error) {
+      return `after block: ${showError(error)}`;
+    }
+  });
+  attempt("using database", () => {
+    let outer: { isOpen: boolean } | null = null;
+    {
+      using a = new DatabaseSync(":memory:");
+      outer = a;
+    }
+    return `open after block: ${outer.isOpen}`;
+  });
+  attempt("dispose closed database", () => {
+    const a = new DatabaseSync(":memory:");
+    a.close();
+    a[Symbol.dispose]();
+    return `open ${a.isOpen}`;
+  });
+  attempt("prepare in a loop", () => {
+    // Many statement objects, few distinct texts: works the same in both
+    // runtimes; run.sh checks separately that scriptc keeps a bounded number
+    // of SQLite statements here.
+    let total = 0;
+    for (let i = 0; i < 5000; i++) {
+      const row = d.prepare(`select ${i % 50} + ? v`).get(1) as Record<string, Value>;
+      total += row["v"] as number;
+    }
+    return `total ${total}`;
+  });
+  attempt("iterator after database close", () => {
+    const a = new DatabaseSync(":memory:");
+    const it = a.prepare("select 1 x union all select 2").iterate();
+    it.next();
+    a.close();
+    return JSON.stringify(it.next());
+  });
+  attempt("statement after reopen", () => {
+    const a = new DatabaseSync(":memory:");
+    const s = a.prepare("select 1 x");
+    a.close();
+    a.open();
+    try {
+      return showRow(s.get() as Record<string, Value>);
+    } finally {
+      a.close();
+    }
+  });
+  d.close();
+}
+
 // ── closing ──────────────────────────────────────────────────────────────
 const leftOver = db.prepare("select 1 x");
 db.close();

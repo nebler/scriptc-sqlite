@@ -2,6 +2,73 @@
 
 Separate from the move work. Uses the published `scriptc@0.4.12` from npm (installed in this folder), not the fork.
 
+## Day 2, 13 November 2026: result
+
+**Done: packaging, the missing everyday pieces, and worker threads.** Every comparison with Node is byte for byte identical, in the release and the sanitized lane, with no sanitizer reports.
+
+| Program | What it checks | Release vs Node | Sanitized vs Node | Peak memory, scriptc vs Node |
+|---|---|---|---|---|
+| `test.mts` (114 lines of output) | day 1's cases plus iterate, columns, expandedSQL, statement close and `using`, options, named-parameter settings | identical | identical | 114 vs 174 MiB |
+| `threads.mts` | 2 writers and 2 readers, each thread with its own connection to one WAL file | identical | identical | 147 vs 272 MiB |
+| `small.mts` | an ordinary small program | identical | — | 37 vs 145 MiB |
+| `pool.mts` (scriptc only) | 200,000 `prepare` calls over 1,000 distinct SQL texts, none closed | — | — | 45 MiB; at most 64 SQLite statements at any time, no leak in the sanitized lane |
+| `example/` | a separate project that installs the package and builds with `scriptc-sqlite`, with its own C function | builds and runs | — | — |
+
+**Size and libraries:** the test binary is 2.8 MB (2.5 MB stripped) and the example app 2.4 MB. Both link only libc and libm.
+
+**Re-run:** after the last full run of `run.sh`, I fixed the README example (see 3 under "What changed"), then rebuilt and ran that one program, not the whole check.
+
+### What changed
+
+1. **Packaging (`bin/scriptc-sqlite.mjs`).** The command takes the same arguments as scriptc: `scriptc-sqlite build app.ts -o app`.
+   - On first use, and whenever the shim or `build.sh` changes, it compiles SQLite (hash-checked) for the requested lane. The sanitized lane is built only when `--sanitize` is given.
+   - It writes a manifest with absolute paths into `build/manifests/`. A project's own `--ffi` manifest is merged in: its functions are added (a clash is an error), its library paths are made absolute and linked first, and its system libraries are added.
+   - It then runs the project's scriptc, else the one beside the package, else `scriptc` on PATH. scriptc's installed command is a native executable, not a JavaScript file.
+   - `scriptc-sqlite manifest` prints a manifest path, for people who run scriptc themselves.
+   - Tested from scratch: with `build/lib` removed, the command rebuilt it, and the shim archive came out byte-identical.
+2. **How it installs, and why only this way.** scriptc compiles a TypeScript package only when it is linked into the project: an npm `file:` dependency, a workspace, or a symlink. A package copied into `node_modules` is refused, because scriptc wants JavaScript plus `.d.ts` files there: `SC2013 ... ships no own .d.ts declaration surface`, or `... not part of the compiled module graph`.
+   - So **a plain `npm install scriptc-sqlite` from the registry would not work today.** `example/` uses `"scriptc-sqlite": "file:.."`.
+   - Two other routes failed: a `node` export condition makes scriptc treat the package as a Node island; and a project `#alias` that points into `node_modules`, or at a bare package name, is refused (SC1010, SC1090).
+3. **Everyday pieces:**
+   - `iterate()`, including `return()`, `break`, spreading, and Node's "iterator was invalidated" when the statement is called during iteration.
+   - `columns()`, which uses SQLite's column metadata, compiled in.
+   - `expandedSQL`, re-bound from the last call's values.
+   - `StatementSync.close()` and `Symbol.dispose` on statements and databases, so `using` in a block works.
+   - Options `timeout` (busy timeout), `enableForeignKeyConstraints`, `enableDoubleQuotedStringLiterals`, `allowBareNamedParameters` and `allowUnknownNamedParameters`, with the per-statement setters and Node's checks of option types.
+   - Null-prototype rows, as in Node.
+   - The README example is now built and run by `run.sh`. That check caught an error in my first README: scriptc refuses `using` at the top level of a module (SC1090), so the example uses `close()`.
+4. **The statement pool.** Node frees a statement nobody uses any more when its garbage collector runs; scriptc has no garbage collector, and its `FinalizationRegistry` never runs callbacks.
+   - So a `StatementSync` no longer holds a SQLite statement between calls. Each call borrows a compiled statement from its database's pool by SQL text, then resets it, clears its bindings and gives it back. The pool keeps at most 64 idle statements, dropping the oldest. An iterator holds its statement until it finishes or `return()` is called.
+   - `prepare()` still compiles at once, so SQL errors appear where Node shows them.
+   - **Consequences:**
+     - A statement whose table was dropped and whose pooled copy was evicted reports the error on its next call, not at `prepare()`. Node, which holds the statement, also reports it on the call.
+     - An iterator a program abandons without `return()` keeps its statement until the database closes.
+
+### Differences from Node found today
+
+- **`returnArrays` is left out.** `setReturnArrays(true)` and the option throw `ERR_METHOD_NOT_IMPLEMENTED`.
+  - Rows are typed as records, as in Node's own type definitions, and scriptc refuses to pass an array where a record is declared (SC2003).
+  - Typing results as "record or array" would allow both, but then `stmt.get() as { id: number }` stops compiling (SC2003, "union conversion has no unambiguous layout mapping"). Such a union also hit an internal compiler error in 0.4.12 (`SC9001 recordKeyGet receiver: expected record, got union`). The usual cast mattered more.
+- **A wrongly typed option** (`{ readOnly: "yes" as unknown as boolean }`) is stopped by scriptc's own run-time type check before the module sees it. scriptc's message replaces Node's `ERR_INVALID_ARG_TYPE`. The case was taken out of the shared test.
+- **The iterator has no iterator helpers** (`.map`, `.filter` on Node's iterator objects).
+- **Calling the statement while one of its iterators is open** gives Node's "iterator was invalidated" on the iterator's next step, as in Node. Our iterator uses its own SQLite statement, but the check copies Node's rule.
+
+### What users need to know (also in README.md)
+
+- **Read rows by casting to a `type`, not an `interface`:** `row as Note` with `type Note = { … }`. TypeScript refuses the cast from a record to an interface. This is the same under Node's types.
+- **`stmt.get() as Shape | undefined` does not compile in scriptc (SC2003); `stmt.get() as Shape` does.** Check for `undefined` before the cast, or use `all()`/`iterate()`.
+- **scriptc's own limits the tests ran into:** no dot access on index-signature types (`row.x` on a `Record`, SC1090); no top-level `using`.
+
+### Worker threads
+
+`threads.mts` passes in both lanes:
+- Readers never saw half a transaction (the count was always a multiple of 50, and the sum always matched), and the count never went down.
+- Both writers' 500 rows arrived, with Unicode labels and blobs intact.
+
+Each thread has its own connection, and the module's buffer and pool are per thread. One connection must not be shared between threads; scriptc's workers could not share one anyway.
+
+Not tested: ThreadSanitizer. The scriptc lane here is AddressSanitizer and LeakSanitizer only.
+
 ## Day 1, 13 November 2026: result
 
 **Both roadblocks are cleared, on Linux arm64.** A `node:sqlite`-shaped module (`src/sqlite.ts`, `DatabaseSync` and `StatementSync`) runs on SQLite 3.54.1, compiled into the program. `test.mts` runs unchanged under Node 24.22.1 (with `node:sqlite`) and as a scriptc binary, and the outputs are **byte for byte identical** in both lanes:
@@ -55,7 +122,7 @@ Separate from the move work. Uses the published `scriptc@0.4.12` from npm (insta
   - Downloads `sqlite-amalgamation-3540100.zip` from sqlite.org and checks its SHA3-256 against the value pinned from sqlite.org's download page (`92281c86…28e30`, taken from the page's PRODUCT line on 13 Nov 2026). It refuses to build on a mismatch.
   - Compiles `sqlite3.c` with the options in the script: thread-safe, FTS5, JSON, math, RTREE, column metadata, session; load_extension, shared cache and deprecated APIs omitted; DQS off. These are chosen to be close to Node's own build.
   - Compiles `native/shim.c` with `-Wall -Wextra -Werror`, and writes the two static archives to `build/lib/`. With `SQLITE_SANITIZE=1` it writes AddressSanitizer builds to `build/lib-san/`.
-- **`ffi.json`** (format 7) links the two archives and `-lm`; `ffi-sanitize.json` links the sanitized pair.
+- **`ffi.json`** (format 7) links the two archives and `-lm`. (Day 1 also had `ffi-sanitize.json` for the sanitized pair; since day 2, `bin/scriptc-sqlite.mjs --sanitize` writes that manifest.)
 - **`native/shim.c`** (about 200 lines) wraps SQLite in fixed signatures:
   - Handles cross as `pointer` (bigint), results as `i32`/`i64`/`f64`.
   - Strings and bytes go in as borrowed spans.
@@ -103,22 +170,27 @@ To reproduce, from the top of the workspace: `. sqlite/env.sh && sh sqlite/run.s
 ## Files
 
 - `build.sh`: fetch, verify and compile SQLite and the shim.
-- `ffi.json`, `ffi-sanitize.json`: the manifests.
+- `ffi.json`: SQLite's manifest. `bin/scriptc-sqlite.mjs` writes merged manifests with absolute paths into `build/manifests/`.
+- `bin/scriptc-sqlite.mjs`: the build command.
+- `README.md`: for users.
+- `example/`: a separate project that uses the package, with its own C function; `example/readme.ts` is the README's example.
 - `native/shim.c`: the C layer.
 - `src/sqlite.ts`: the module. `src/node-sqlite.ts` is Node's side of `#sqlite`.
-- `test.mts`: the comparison test. `small.mts`: the memory figure.
-- `run.sh`: everything, with the summary in `build/summary.txt`.
+- `test.mts`: the comparison test.
+- `threads.mts`: worker threads.
+- `small.mts`: the memory figure.
+- `pool.mts`: the statement pool (scriptc only).
+- `run.sh`: everything, through `bin/scriptc-sqlite.mjs`, with the summary in `build/summary.txt` (about 8 minutes here).
 - `tools/peakrss.c`: peak memory of a child process.
 - `env.sh`: puts clang on PATH (sources the workspace's `.fern/env.sh`).
 - `build/` and `node_modules/` are ignored by git.
 
-## For day 2 (not started)
+## Next (not started)
 
-- `finalize()` and a statement cache.
-- `iterate()`.
-- Null-prototype rows if scriptc can make them.
-- User functions through FFI callbacks.
-- Worker-thread test.
-- A packaging story given that `--lib` has no FFI.
-- Check whether the published build works without the postinstall step.
+- User functions and aggregates, through FFI callbacks.
+- The macOS build, checked on the Mac. That is also where memory figures count.
+- `returnArrays` as a separate, separately typed call, if wanted.
+- Publishing that survives a plain `npm install`. This needs scriptc to compile the TypeScript sources of a copied package, or a different packaging scheme. A question for upstream, with the owner's go.
+- A ThreadSanitizer run of `threads.mts`.
+- Whether the published scriptc builds without its postinstall step.
 - A query library on top, once one compiles without Node islands.

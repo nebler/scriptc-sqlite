@@ -67,11 +67,15 @@ flags="-O2 -fPIC -DNDEBUG \
   -DSQLITE_ENABLE_SESSION \
   -DSQLITE_ENABLE_PREUPDATE_HOOK"
 
-echo "compiling sqlite3.c into $lib (about a minute)"
-# shellcheck disable=SC2086
-$CC $flags $extra -c "$src/sqlite3.c" -o "$obj/sqlite3.o"
-rm -f "$lib/libsqlite3.a"
-ar rcs "$lib/libsqlite3.a" "$obj/sqlite3.o"
+# SQLite itself is recompiled only when this script changed (its options
+# live here) or the object is missing.
+if [ ! -f "$obj/sqlite3.o" ] || [ "$0" -nt "$obj/sqlite3.o" ]; then
+  echo "compiling sqlite3.c into $lib (about a minute)"
+  # shellcheck disable=SC2086
+  $CC $flags $extra -c "$src/sqlite3.c" -o "$obj/sqlite3.o"
+  rm -f "$lib/libsqlite3.a"
+  ar rcs "$lib/libsqlite3.a" "$obj/sqlite3.o"
+fi
 
 # shellcheck disable=SC2086
 $CC -O2 -fPIC -Wall -Wextra -Werror $extra -I"$src" -c native/shim.c -o "$obj/shim.o"

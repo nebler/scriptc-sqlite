@@ -1,15 +1,33 @@
 {
   "name": "scriptc-sqlite",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A node:sqlite-shaped module for stock scriptc, with SQLite built in",
-  "devDependencies": {
-    "scriptc": "0.4.12"
+  "description": "node:sqlite for scriptc programs, with SQLite compiled in",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": {
+      "types": "./src/sqlite.ts",
+      "default": "./src/sqlite.ts"
+    }
   },
+  "bin": {
+    "scriptc-sqlite": "./bin/scriptc-sqlite.mjs"
+  },
+  "files": [
+    "bin/",
+    "native/",
+    "src/sqlite.ts",
+    "build.sh",
+    "ffi.json"
+  ],
   "imports": {
     "#sqlite": {
       "node": "./src/node-sqlite.ts",
       "default": "./src/sqlite.ts"
     }
+  },
+  "devDependencies": {
+    "scriptc": "0.4.12"
   }
 }

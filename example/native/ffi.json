@@ -1,0 +1,5 @@
+{
+  "ffi_format": 1,
+  "functions": [{ "name": "exampleTag", "symbol": "example_tag", "params": ["string"], "returns": "u32" }],
+  "libraries": ["./tag.o"]
+}

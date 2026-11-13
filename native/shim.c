@@ -30,7 +30,8 @@ static const char *nonnull(const uint8_t *p) { return p ? (const char *)p : ""; 
  * still be non-null so that the error can be read, and must be closed. The
  * defaults follow Node's node:sqlite: foreign keys on, double-quoted string
  * literals off. */
-void *sqx_open(const uint8_t *path, size_t path_len, int32_t read_only) {
+void *sqx_open(const uint8_t *path, size_t path_len, int32_t read_only, int32_t foreign_keys,
+               int32_t dqs, int32_t timeout_ms) {
   char name[4096];
   if (path_len >= sizeof name) return NULL;
   if (path_len) memcpy(name, path, path_len);
@@ -39,9 +40,10 @@ void *sqx_open(const uint8_t *path, size_t path_len, int32_t read_only) {
   int flags = read_only ? SQLITE_OPEN_READONLY : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
   int rc = sqlite3_open_v2(name, &db, flags | SQLITE_OPEN_URI, NULL);
   if (rc == SQLITE_OK && db) {
-    sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_FKEY, 1, (int *)NULL);
-    sqlite3_db_config(db, SQLITE_DBCONFIG_DQS_DML, 0, (int *)NULL);
-    sqlite3_db_config(db, SQLITE_DBCONFIG_DQS_DDL, 0, (int *)NULL);
+    sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_FKEY, foreign_keys ? 1 : 0, (int *)NULL);
+    sqlite3_db_config(db, SQLITE_DBCONFIG_DQS_DML, dqs ? 1 : 0, (int *)NULL);
+    sqlite3_db_config(db, SQLITE_DBCONFIG_DQS_DDL, dqs ? 1 : 0, (int *)NULL);
+    if (timeout_ms > 0) sqlite3_busy_timeout(db, timeout_ms);
   }
   return db;
 }
@@ -126,6 +128,17 @@ int64_t sqx_sql(void *stmt, uint8_t *out, size_t cap) {
   return s ? copy_out(s, strlen(s), out, cap) : 0;
 }
 
+/* The statement's text with its current bindings written in. SQLite makes a
+ * fresh copy each time, so a second call with a bigger buffer gets the same
+ * text as long as the bindings did not change in between. */
+int64_t sqx_expanded_sql(void *stmt, uint8_t *out, size_t cap) {
+  char *s = sqlite3_expanded_sql((sqlite3_stmt *)stmt);
+  if (!s) return -1;
+  int64_t n = copy_out(s, strlen(s), out, cap);
+  sqlite3_free(s);
+  return n;
+}
+
 /* ── parameters ──────────────────────────────────────────────────────── */
 
 int32_t sqx_param_count(void *stmt) { return sqlite3_bind_parameter_count((sqlite3_stmt *)stmt); }
@@ -166,6 +179,19 @@ int32_t sqx_column_count(void *stmt) { return sqlite3_column_count((sqlite3_stmt
 int64_t sqx_column_name(void *stmt, int32_t i, uint8_t *out, size_t cap) {
   const char *n = sqlite3_column_name((sqlite3_stmt *)stmt, i);
   return n ? copy_out(n, strlen(n), out, cap) : 0;
+}
+
+/* Where a result column comes from: which = 0 database, 1 table, 2 column
+ * in that table, 3 declared type. -1 when SQLite has no answer (an
+ * expression, a literal). Needs SQLITE_ENABLE_COLUMN_METADATA. */
+int64_t sqx_column_origin(void *stmt, int32_t i, int32_t which, uint8_t *out, size_t cap) {
+  sqlite3_stmt *s = (sqlite3_stmt *)stmt;
+  const char *v = which == 0   ? sqlite3_column_database_name(s, i)
+                  : which == 1 ? sqlite3_column_table_name(s, i)
+                  : which == 2 ? sqlite3_column_origin_name(s, i)
+                               : sqlite3_column_decltype(s, i);
+  if (!v) return -1;
+  return copy_out(v, strlen(v), out, cap);
 }
 
 /* SQLITE_INTEGER 1, FLOAT 2, TEXT 3, BLOB 4, NULL 5. */

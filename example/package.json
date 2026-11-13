@@ -1,0 +1,13 @@
+{
+  "name": "scriptc-sqlite-example",
+  "private": true,
+  "type": "module",
+  "description": "A separate project that uses scriptc-sqlite the way another project would",
+  "scripts": {
+    "prebuild": "clang -O2 -c native/tag.c -o native/tag.o",
+    "build": "scriptc-sqlite build app.ts --ffi native/ffi.json -o build/app"
+  },
+  "dependencies": {
+    "scriptc-sqlite": "file:.."
+  }
+}
