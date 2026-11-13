@@ -1,0 +1,2 @@
+// Under Node, "#sqlite" is Node's own node:sqlite (see package.json).
+export { DatabaseSync, StatementSync } from "node:sqlite";
