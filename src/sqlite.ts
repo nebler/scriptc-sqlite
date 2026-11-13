@@ -357,12 +357,15 @@ const SQLITE_DIRECTONLY = 0x80000;
 
 type AnyCall = (...args: unknown[]) => unknown;
 
+/** A user function or aggregate. The callbacks are cast to AnyCall once,
+ * here, rather than on every call: a cast from unknown to a function type
+ * costs scriptc 0.4.12 about as much as the call itself. */
 interface Registered {
   bigints: boolean;
-  fn: unknown;
+  fn: AnyCall;
   start: unknown;
-  inverse: unknown;
-  result: unknown;
+  inverse: AnyCall | null;
+  result: AnyCall | null;
 }
 
 /** One aggregate group's state, found through the slot number the shim
@@ -425,15 +428,15 @@ function dispatchCall(op: number, id: number, argc: number): number {
       return 1;
     }
     if (op === OP_FUNC) {
-      setResult(callFunction(entry.fn as AnyCall, argc, entry.bigints));
+      setResult(callFunction(entry.fn, argc, entry.bigints));
       return 1;
     }
     const slot = groupSlot(entry);
     if (slot < 0) return 1;
     const group = groups.get(slot)!;
     if (op === OP_STEP || op === OP_INVERSE) {
-      const fn = op === OP_STEP ? entry.fn : entry.inverse;
-      group.value = callStep(fn as AnyCall, group.value, argc, entry.bigints);
+      const fn = op === OP_STEP ? entry.fn : entry.inverse!;
+      group.value = callStep(fn, group.value, argc, entry.bigints);
       return 1;
     }
     // OP_VALUE or OP_FINAL. Node gives no result from xFinal once the
@@ -444,7 +447,7 @@ function dispatchCall(op: number, id: number, argc: number): number {
       return 1;
     }
     try {
-      setResult(entry.result !== undefined ? (entry.result as AnyCall)(group.value) : group.value);
+      setResult(entry.result !== null ? entry.result(group.value) : group.value);
     } finally {
       if (op === OP_FINAL) groups.delete(slot);
     }
@@ -842,10 +845,10 @@ export class DatabaseSync {
     const id = ++nextFunctionId;
     registered.set(id, {
       bigints: options.useBigIntArguments === true,
-      fn,
+      fn: fn as AnyCall,
       start: undefined,
-      inverse: undefined,
-      result: undefined,
+      inverse: null,
+      result: null,
     });
     // On failure SQLite drops the function, which removes it from
     // `registered` again.
@@ -888,10 +891,10 @@ export class DatabaseSync {
     const id = ++nextFunctionId;
     registered.set(id, {
       bigints: o.useBigIntArguments === true,
-      fn: step,
+      fn: step as AnyCall,
       start,
-      inverse,
-      result: typeof result === "function" ? result : undefined,
+      inverse: inverse !== undefined ? (inverse as AnyCall) : null,
+      result: typeof result === "function" ? (result as AnyCall) : null,
     });
     const flags = o.directOnly === true ? SQLITE_DIRECTONLY : 0;
     const rc = sqxCreateAggregate(db, name, argc, flags, id, inverse !== undefined ? 1 : 0);

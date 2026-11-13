@@ -2,6 +2,53 @@
 
 Uses the published `scriptc@0.4.12` from npm. Days 1 and 2 were built and checked in a Linux arm64 sandbox (gVisor); macOS arm64 was checked afterwards. Day 3 ran in a different Linux arm64 sandbox, with Zig as the C toolchain.
 
+## Day 5, 13 November 2026: performance
+
+**Every workload got faster, none slower; outputs still identical to Node.** Profiled with `perf` on a quiet Linux arm64 host (4 Neoverse-N1 cores, outside any sandbox), each change timed alone (median of 5 to 7 whole-process runs, min within 2% of the median) and kept only if it helped. The box timings rule still holds: none of these numbers come from a sandbox.
+
+| Workload (1M rows; text 100k) | before | after | Node 24 on the same host |
+|---|---|---|---|
+| read | 2635 ms | 1759 ms | 2766 ms |
+| insert | 2763 ms | 1731 ms | 2698 ms |
+| text | 527 ms | 414 ms | 1265 ms |
+| udf | 1038 ms | 292 ms | 365 ms |
+
+On GitHub's runners (PR #1 comment), scriptc ÷ Node went from 1.14 (insert), 1.13 (read), 0.75 (text) and 3.20 (udf) on Linux x64 to below 1 everywhere but udf (1.05) after the first two rounds; the comment on the PR has the current tables for all three platforms.
+
+### What it took
+
+| Change | Where it paid |
+|---|---|
+| A new `TextDecoder` per value instead of one shared decoder (a reused one costs ~3× in scriptc 0.4.12) | read −20% |
+| Positional parameter indexes found once per statement, not `sqlite3_bind_parameter_name` + a text decode per parameter per `run()`; parameter count cached too | insert |
+| No closure per text or blob value (`readText((out) => …)`) | read, text |
+| SQL functions: no argument array and spread for up to 3 arguments | udf −54% |
+| SQL functions: the call's context and arguments stay in C thread-locals (saved and restored around nested calls); TypeScript gets `(op, id, argc)` as plain numbers, so no pointer bigint per call; integer arguments come as doubles when safe | udf −21% |
+| SQL functions: the user's callbacks cast to a callable type once at registration, not on every call (the cast built an adapter closure each time) | udf −24% |
+| `SQLITE_OPEN_NOMUTEX`: a connection never leaves its thread in scriptc, so SQLite's serialized-mode mutex on every step and column read was pure cost (a third of a plain C scan) | read −7%, insert −5% |
+| Lengths and row sizes returned as doubles, integer columns as a double when safe, `changes`/`lastInsertRowid` as doubles unless `readBigInts`: no bigint per row or value | read, insert |
+| Statement pool: the statement just given back waits outside the map (one string comparison to take it again); statements in use kept in an array (a pop) instead of a `Set<bigint>` (two hashes per `run()`) | insert −10% |
+| Per-value row reads by default again: packed reads (day 4) were slower on macOS and no faster on Linux, because an FFI call costs a few nanoseconds; `SCRIPTC_SQLITE_ROW_READS=packed` keeps them for comparison | read (macOS) |
+
+### What scriptc costs (scriptc 0.4.12, measured with small programs on the same host)
+
+- **FFI calls are cheap:** ~5 ns with a pointer (bigint) argument, ~2 ns with a double; an `i64` return ~11 ns against ~4 ns for `f64`.
+- **Dynamic values are not:** casting a row (`Record<string, …>`) to an object type checks every field, ~450 ns per row; reading three fields by index from such a row is slower still. This is in the caller's code and dominates the read benchmark. Calling a function held as `unknown` through a cast built an adapter closure per call (~320 ns for the 8-parameter `SQLFunction` shape, ~40 ns for a function typed `(x: number) => …`).
+- **Things that cost nothing much:** `for…of` over a class iterator (~15 ns per row), creating a null-prototype object with three keys inline (~150 ns).
+- **`--optimization speed`** gained 1–5%: not worth a different default.
+
+### Tried and not kept
+
+- **Typed parameters** (`...params: SQLParameter[]` instead of `unknown[]`): no faster, and it would refuse calls Node accepts (tests pass `undefined` on purpose).
+- **Finalizing every statement of the connection in C** (`sqlite3_next_stmt`) on close, instead of tracking the lent ones: crashed the demo, because FTS5 keeps statements of its own on the connection and finalizes them itself. The demo session in `run.sh` caught it.
+- **A callback from C carrying a `string`** (decoded by scriptc) instead of copying into a buffer and decoding: ~20% faster per string, not worth a second path.
+- **Calling every function as the 8-parameter shape** (~10× faster per call): wrong for a function with a rest parameter, which would see 8 arguments instead of Node's count, and scriptc gives no way to tell such a function apart at run time.
+
+### Where the gaps are now
+
+- **Reads are still 2–4× behind Bun and Rust.** What is left is mostly building and checking dynamic row objects in scriptc, on both sides of the API. A typed read API (rows built as fixed shapes the compiler knows) is the way past it; that is a feature, not a fix.
+- **SQL functions** are close to Node; the rest is boxing arguments for a call through an unknown function type.
+
 ## Day 4, 13 November 2026: result
 
 **Done, release lane only (still no AddressSanitizer runtime in this box):**
