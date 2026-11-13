@@ -262,7 +262,7 @@ double sqx_column_number(void *stmt, int32_t i) {
 }
 
 /* A TEXT column copied as for sqx_column_text; -1 if the column is not
- * TEXT (nothing converted). Likewise for BLOB. */
+ * TEXT (nothing converted). */
 double sqx_column_text_typed(void *stmt, int32_t i, uint8_t *out, size_t cap) {
   sqlite3_stmt *s = (sqlite3_stmt *)stmt;
   if (sqlite3_column_type(s, i) != SQLITE_TEXT) return -1;
@@ -271,12 +271,23 @@ double sqx_column_text_typed(void *stmt, int32_t i, uint8_t *out, size_t cap) {
   return t ? (double)copy_out(t, n, out, cap) : 0;
 }
 
-double sqx_column_blob_typed(void *stmt, int32_t i, uint8_t *out, size_t cap) {
+/* Typed byte reads: the length of a TEXT (as UTF-8) or BLOB column when the
+ * column has type `want`, -1 when it has another type. Then
+ * sqx_column_copy copies the value into a buffer of exactly that size, so
+ * TypeScript allocates once and nothing is copied twice. */
+double sqx_column_len_typed(void *stmt, int32_t i, int32_t want) {
   sqlite3_stmt *s = (sqlite3_stmt *)stmt;
-  if (sqlite3_column_type(s, i) != SQLITE_BLOB) return -1;
-  const void *b = sqlite3_column_blob(s, i);
+  if (sqlite3_column_type(s, i) != want) return -1;
+  if (want == SQLITE_TEXT) sqlite3_column_text(s, i);
+  return (double)sqlite3_column_bytes(s, i);
+}
+
+void sqx_column_copy(void *stmt, int32_t i, uint8_t *out, size_t cap) {
+  sqlite3_stmt *s = (sqlite3_stmt *)stmt;
+  const void *p = sqlite3_column_type(s, i) == SQLITE_TEXT ? (const void *)sqlite3_column_text(s, i)
+                                                           : sqlite3_column_blob(s, i);
   size_t n = (size_t)sqlite3_column_bytes(s, i);
-  return b ? (double)copy_out(b, n, out, cap) : 0;
+  if (p && n > 0) memcpy(out, p, n < cap ? n : cap);
 }
 
 /* An integer column as a double within ±(2^53 - 1), NaN outside (as

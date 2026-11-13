@@ -122,7 +122,7 @@ if [ "$got" = "added 1|added 2|done 1|[x] 1  first|[ ] 2  second|" ]; then note 
 
 # The benchmark programs agree with each other (no timings: --check).
 echo "checking the benchmark programs"
-if node bench/run.mjs --check --only=scriptc,scriptc-packed,scriptc-typed,node > build/bench-check.out 2>&1; then note "benchmark programs: checksums agree (scriptc, packed reads, typed API, node)"; else note "benchmark programs: CHECKSUMS DIFFER (see build/bench-check.out)"; status=1; fi
+if node bench/run.mjs --check --only=scriptc,scriptc-packed,scriptc-typed,scriptc-bytes,node > build/bench-check.out 2>&1; then note "benchmark programs: checksums agree (scriptc, packed reads, typed API, text as bytes, node)"; else note "benchmark programs: CHECKSUMS DIFFER (see build/bench-check.out)"; status=1; fi
 
 size() { wc -c < "$1" | tr -d ' '; }
 cp build/bin/test build/bin/test-stripped

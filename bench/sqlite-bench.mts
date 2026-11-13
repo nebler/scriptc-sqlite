@@ -96,7 +96,8 @@ function udf(path: string): string {
 // The same workloads through this package's typed API (not in node:sqlite):
 // reads through StatementSync.map/forEach with columns read by index and
 // type, inserts through runMany, the function through numberFunction. Run
-// when a fifth argument says "typed".
+// when a fifth argument says "typed" (or "bytes": the same, with text read
+// as bytes).
 function startupTyped(path: string): string {
   const db = new DatabaseSync(path, { readOnly: true });
   const row = db
@@ -126,6 +127,43 @@ function textTyped(path: string): string {
     const d = c.blob(1);
     sum.rows++;
     sum.chars += c.text(0).length;
+    sum.bytes += d.length;
+    sum.check += d[0]! + d[d.length >> 1]! + d[d.length - 1]!;
+  });
+  db.close();
+  return `${sum.rows} ${sum.chars} ${sum.bytes} ${sum.check}`;
+}
+
+// Text as bytes ("bytes" mode): each text value copied into a fresh
+// Uint8Array with row.textBytes() and its characters counted over the
+// UTF-8, which is what Go, Rust and Goose do, instead of decoding it into
+// a string and taking .length.
+function codePoints(bytes: Uint8Array): number {
+  let count = 0;
+  for (let i = 0; i < bytes.length; i++) if ((bytes[i]! & 0xc0) !== 0x80) count++;
+  return count;
+}
+
+function readBytes(path: string): string {
+  const db = new DatabaseSync(path, { readOnly: true });
+  const sum = { rows: 0, n: 0, r: 0, chars: 0 };
+  db.prepare("select n, r, body from t").forEach((c) => {
+    sum.rows++;
+    sum.n += c.number(0);
+    sum.r += c.number(1);
+    sum.chars += codePoints(c.textBytes(2));
+  });
+  db.close();
+  return `${sum.rows} ${sum.n} ${sum.r * 2} ${sum.chars}`;
+}
+
+function textBytes(path: string): string {
+  const db = new DatabaseSync(path, { readOnly: true });
+  const sum = { rows: 0, chars: 0, bytes: 0, check: 0 };
+  db.prepare("select body, data from t2").forEach((c) => {
+    const d = c.blob(1);
+    sum.rows++;
+    sum.chars += codePoints(c.textBytes(0));
     sum.bytes += d.length;
     sum.check += d[0]! + d[d.length >> 1]! + d[d.length - 1]!;
   });
@@ -164,12 +202,13 @@ function udfTyped(path: string): string {
 const workload = process.argv[2] ?? "";
 const path = process.argv[3] ?? "";
 const n = Number(process.argv[4] ?? "0");
-const typed = process.argv[5] === "typed";
+const bytes = process.argv[5] === "bytes";
+const typed = process.argv[5] === "typed" || bytes;
 if (workload === "version") console.log(version(path));
 else if (workload === "startup") console.log(typed ? startupTyped(path) : startup(path));
 else if (workload === "insert") console.log(typed ? insertTyped(path, n) : insert(path, n));
-else if (workload === "read") console.log(typed ? readTyped(path) : read(path));
-else if (workload === "text") console.log(typed ? textTyped(path) : text(path));
+else if (workload === "read") console.log(bytes ? readBytes(path) : typed ? readTyped(path) : read(path));
+else if (workload === "text") console.log(bytes ? textBytes(path) : typed ? textTyped(path) : text(path));
 else if (workload === "udf") console.log(typed ? udfTyped(path) : udf(path));
 else {
   console.error(`unknown workload ${JSON.stringify(workload)}`);

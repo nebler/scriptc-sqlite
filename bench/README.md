@@ -7,6 +7,7 @@ The same SQLite workloads in eight forms, so the scriptc build can be compared w
 | scriptc | `sqlite-bench.mts`, compiled with `bin/scriptc-sqlite.mjs` | compiled in by `build.sh` |
 | scriptc (packed reads) | the same binary with `SCRIPTC_SQLITE_ROW_READS=packed` (one FFI call per row that copies the whole row into a buffer; measured slower than the default per-value reads) | same |
 | scriptc (typed API) | the same binary with a `typed` argument: reads through `map()`/`forEach()` and typed column getters instead of row objects, `insert` through `runMany()`, `udf` through `numberFunction()` (this package's extensions, not in `node:sqlite`) | same |
+| scriptc (typed API, text as bytes) | as the typed API, but `read` and `text` take each text value as a fresh copy of its UTF-8 bytes (`row.textBytes()`) and count its characters over the bytes, as Go, Rust and Goose do, instead of decoding a string | same |
 | Node | `sqlite-bench.mts` under Node 24 (`node:sqlite`) | bundled with Node |
 | Deno | `sqlite-bench.mts` under Deno 2 (`node:sqlite`, through the package's `#sqlite` import) | bundled with Deno |
 | Bun | `bun-bench.ts` (`bun:sqlite`) | bundled on Linux; **the system's SQLite on macOS** |
@@ -39,7 +40,7 @@ $ node bench/run.mjs --n=read=200000     # change N per workload
 $ node bench/run.mjs --check             # small N, one run each, checksums only, no timings
 ```
 
-Results go to `bench/results/<platform>.json` (every run) and `<platform>.md` (the tables). Implementation ids for `--only`: `scriptc`, `scriptc-packed`, `scriptc-typed`, `node`, `deno`, `bun`, `go`, `rust`, `goose`.
+Results go to `bench/results/<platform>.json` (every run) and `<platform>.md` (the tables). Implementation ids for `--only`: `scriptc`, `scriptc-packed`, `scriptc-typed`, `scriptc-bytes`, `node`, `deno`, `bun`, `go`, `rust`, `goose`.
 
 In CI: Actions → Benchmark → Run workflow (`.github/workflows/bench.yml`). It runs `--check`, then the benchmark, on Linux x64, Linux arm64 and macOS arm64. The tables land in the job summary and `bench/results/` is uploaded as an artifact.
 

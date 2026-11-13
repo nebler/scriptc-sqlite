@@ -100,7 +100,7 @@ db.prepare("select body from notes").forEach((row) => {
 ```
 
 - **`map(read, ...params)`** returns `read(row)` for each row; **`forEach(fn, ...params)`** only calls `fn(row)`. Parameters work as for `all()`.
-- **The row** reads a column by index: `number(i)` (INTEGER or REAL), `text(i)`, `blob(i)`, `isNull(i)`, `value(i)` (as `all()` would give it), and `length`. A column of another type throws `ERR_SQLITE_COLUMN_TYPE`; nothing is converted silently. Integers beyond ±(2^53 − 1) throw `ERR_OUT_OF_RANGE`, as in Node. The row is only valid inside the callback.
+- **The row** reads a column by index: `number(i)` (INTEGER or REAL), `text(i)`, `textBytes(i)` (a TEXT column's UTF-8 bytes, copied, without making a string), `blob(i)`, `isNull(i)`, `value(i)` (as `all()` would give it), and `length`. A column of another type throws `ERR_SQLITE_COLUMN_TYPE`; nothing is converted silently. Integers beyond ±(2^53 − 1) throw `ERR_OUT_OF_RANGE`, as in Node. The row is only valid inside the callback.
 - **Why it's faster:** `all()` and `iterate()` build a dynamic object per row, and `row as Note` then makes scriptc check every field at run time. Here the callback returns an object literal of a declared type, which scriptc builds natively. Reading a million rows takes about a third of the time of `iterate()` (the benchmark's "typed reads" row).
 - **Under Node:** this repository's test programs import `#sqlite`, which under Node is `node:sqlite` with these two methods added (`src/node-sqlite.ts`), so the same program runs in both. `typed.mts` checks that the two agree byte for byte.
 

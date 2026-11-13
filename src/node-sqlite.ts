@@ -70,6 +70,12 @@ export class Columns {
     throw codedError(`Column ${i} holds ${kind(value)}, not a blob`, "ERR_SQLITE_COLUMN_TYPE");
   }
 
+  textBytes(i: number): Uint8Array {
+    const value = this.#at(i);
+    if (typeof value === "string") return new TextEncoder().encode(value);
+    throw codedError(`Column ${i} holds ${kind(value)}, not text`, "ERR_SQLITE_COLUMN_TYPE");
+  }
+
   isNull(i: number): boolean {
     return this.#at(i) === null;
   }

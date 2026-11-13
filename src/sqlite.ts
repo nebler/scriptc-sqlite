@@ -50,8 +50,9 @@ declare function sqxColumnType(stmt: bigint, index: number): number;
 declare function sqxColumnInt64(stmt: bigint, index: number): bigint;
 declare function sqxColumnSafeInt(stmt: bigint, index: number): number;
 declare function sqxColumnNumber(stmt: bigint, index: number): number;
+declare function sqxColumnLenTyped(stmt: bigint, index: number, type: number): number;
+declare function sqxColumnCopy(stmt: bigint, index: number, out: Uint8Array): void;
 declare function sqxColumnTextTyped(stmt: bigint, index: number, out: Uint8Array): number;
-declare function sqxColumnBlobTyped(stmt: bigint, index: number, out: Uint8Array): number;
 declare function sqxColumnDouble(stmt: bigint, index: number): number;
 declare function sqxColumnText(stmt: bigint, index: number, out: Uint8Array): number;
 declare function sqxColumnBlob(stmt: bigint, index: number, out: Uint8Array): number;
@@ -1682,13 +1683,23 @@ export class Columns {
   /** A BLOB column as a new Uint8Array. */
   blob(i: number): Uint8Array {
     this.#check(i);
-    let n = sqxColumnBlobTyped(this.#stmt, i, scratch);
-    if (n < 0) throw columnTypeError(i, sqxColumnType(this.#stmt, i), "a blob");
-    if (n > scratch.length) {
-      scratch = new Uint8Array(Math.max(n, scratch.length * 2));
-      n = sqxColumnBlobTyped(this.#stmt, i, scratch);
-    }
-    return n === 0 ? new Uint8Array(0) : scratch.slice(0, n);
+    return this.#bytes(i, SQLITE_BLOB, "a blob");
+  }
+
+  /** A TEXT column's UTF-8 bytes, as a new Uint8Array: the text without
+   * decoding it into a string, for code that works on bytes. */
+  textBytes(i: number): Uint8Array {
+    this.#check(i);
+    return this.#bytes(i, SQLITE_TEXT, "text");
+  }
+
+  /** Column i copied once into an array of its exact size. */
+  #bytes(i: number, type: number, wanted: string): Uint8Array {
+    const n = sqxColumnLenTyped(this.#stmt, i, type);
+    if (n < 0) throw columnTypeError(i, sqxColumnType(this.#stmt, i), wanted);
+    const out = new Uint8Array(n);
+    if (n > 0) sqxColumnCopy(this.#stmt, i, out);
+    return out;
   }
 
   /** Whether column i is NULL. */

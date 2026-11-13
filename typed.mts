@@ -69,6 +69,19 @@ console.log(`length: ${db.prepare("select 1, 2, 3").map((c) => c.length).join(",
 
 attempt("blobs", () => db.prepare("select data from t order by id").map((c) => hex(c.blob(0))).join(" "));
 
+attempt("textBytes", () =>
+  db
+    .prepare("select body from t order by id")
+    .map((c) => `${c.textBytes(0).length}:${hex(c.textBytes(0))}`)
+    .join(" "),
+);
+attempt("textBytes of a blob", () => String(db.prepare("select data from t").map((c) => c.textBytes(0).length)));
+attempt("textBytes of a number", () => String(db.prepare("select n from t").map((c) => c.textBytes(0).length)));
+attempt("blob() is a copy", () => {
+  const blobs = db.prepare("select data from t order by id").map((c) => c.blob(0));
+  blobs[0]![0] = 99;
+  return blobs.map((b) => hex(b)).join(" ") + " / " + db.prepare("select hex(data) from t order by id").map((c) => c.text(0)).join(" ");
+});
 attempt("value()", () =>
   db
     .prepare("select n, r, body, maybe from t where id = 1")

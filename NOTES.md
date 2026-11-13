@@ -2,6 +2,24 @@
 
 Uses the published `scriptc@0.4.12` from npm. Days 1 and 2 were built and checked in a Linux arm64 sandbox (gVisor); macOS arm64 was checked afterwards. Day 3 ran in a different Linux arm64 sandbox, with Zig as the C toolchain.
 
+## Day 5, continued: text as bytes, and what the build can still do
+
+**`row.textBytes(i)`:** a TEXT column's UTF-8 bytes, copied once into an array of exact size (C reports the length, TypeScript allocates, C copies; `blob()` now reads the same way instead of copying twice). The benchmark's "typed API, text as bytes" row counts characters over those bytes, which is the work Go, Rust and Goose do. Reads: 408 ms against 488 with strings (Linux arm64 host). The 1 KB `text` workload: 296 against 265 ms, slower: for long values a zero-filled array plus a byte loop costs more than scriptc's decode and `.length` (the loop itself runs at about 0.45 ns a byte). Measuring only a length computed in C would not be a fair row: every other implementation copies the text.
+
+**Under the hood, measured on the same host (typed API):**
+
+| | as built | mimalloc | PGO | LTO |
+|---|---|---|---|---|
+| read | 491 | 487 | 465 | 483 |
+| text | 265 | 278 | 275 | 264 |
+| insert | 1075 | 1129 | 1079 | 1030 |
+| udf | 164 | 165 | 137 | 141 |
+
+- **mimalloc**, linked in as the program's allocator: no gain on Linux; glibc's per-thread cache already serves these sizes. Dropped.
+- **PGO** (`--profile-generate` / `--profile-use`, with LLVM 22's profile runtime built from source, since Zig ships none): −16% on functions, −5% on reads. Trained on the same workloads it was measured on, so a best case. Not used.
+- **LTO across TypeScript, shim and SQLite:** scriptc's code generator is LLVM 22.1.8, the same as Zig's clang, so the program's kept IR (`*.ll`), the shim and SQLite compiled with `-flto`, and scriptc's runtime objects link into one optimized program, with outputs unchanged. Inserts −9%, functions −11%. It needs the build to capture scriptc's link step and relink by hand, which depends on scriptc's internals; not built into `scriptc-sqlite build` (yet).
+- PGO and LTO together were no better than either: the profile does not survive into the kept IR.
+
 ## Day 5, continued: runMany and numberFunction
 
 **`stmt.runMany(count, bind)`** and **`db.numberFunction(name, fn)`** (README, "Fast writes and number functions"), for the two workloads where Goose was still ahead after typed reads (inserts 1.25×, functions 2.6× on Linux arm64).
