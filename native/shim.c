@@ -117,6 +117,11 @@ int64_t sqx_changes(void *db) { return sqlite3_changes64((sqlite3 *)db); }
 
 int64_t sqx_last_insert_rowid(void *db) { return sqlite3_last_insert_rowid((sqlite3 *)db); }
 
+/* The same two as doubles, for the default (non-bigint) results: Number()
+ * of the int64 rounds the same way, without a bigint per run(). */
+double sqx_changes_f64(void *db) { return (double)sqlite3_changes64((sqlite3 *)db); }
+double sqx_last_insert_rowid_f64(void *db) { return (double)sqlite3_last_insert_rowid((sqlite3 *)db); }
+
 /* ── statements ──────────────────────────────────────────────────────── */
 
 /* Compiles the first statement of `sql`. Returns NULL on error (read it with
@@ -412,12 +417,13 @@ int64_t sqx_getenv(const uint8_t *name, size_t name_len, uint8_t *out, size_t ca
   return v ? copy_out(v, strlen(v), out, cap) : -1;
 }
 
-/* 1 when SCRIPTC_SQLITE_ROW_READS=columns asks for the per-value read
- * path. Read here, not through process.env: in scriptc 0.4.12, touching
- * process.env costs about 10 MiB of memory per thread. */
-int32_t sqx_columns_mode(void) {
+/* 1 when SCRIPTC_SQLITE_ROW_READS=packed asks for packed row reads
+ * (sqx_step_row) instead of per-value reads. Read here, not through
+ * process.env: in scriptc 0.4.12, touching process.env costs about
+ * 10 MiB of memory per thread. */
+int32_t sqx_packed_mode(void) {
   const char *v = getenv("SCRIPTC_SQLITE_ROW_READS");
-  return v && strcmp(v, "columns") == 0;
+  return v && strcmp(v, "packed") == 0;
 }
 
 /* Steps; on a row, packs it as sqx_row does and returns its length (>= 0).

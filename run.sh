@@ -50,8 +50,8 @@ for name in test threads udf-threads query migrate small; do
 done
 # The older read path, one or two FFI calls per value, kept for the
 # benchmark's comparison: the same answers.
-SCRIPTC_SQLITE_ROW_READS=columns build/bin/test > build/test-columns.out 2>&1 || status=1
-if cmp -s build/test-node.out build/test-columns.out; then note "test release, per-column reads: identical to Node"; else note "test release, per-column reads: DIFFERENT"; status=1; fi
+SCRIPTC_SQLITE_ROW_READS=packed build/bin/test > build/test-packed.out 2>&1 || status=1
+if cmp -s build/test-node.out build/test-packed.out; then note "test release, packed reads: identical to Node"; else note "test release, packed reads: DIFFERENT"; status=1; fi
 if [ "$sanitize" = 1 ]; then
   for name in test threads udf-threads query migrate; do
     echo "building $name, sanitized"
@@ -122,7 +122,7 @@ if [ "$got" = "added 1|added 2|done 1|[x] 1  first|[ ] 2  second|" ]; then note 
 
 # The benchmark programs agree with each other (no timings: --check).
 echo "checking the benchmark programs"
-if node bench/run.mjs --check --only=scriptc,scriptc-columns,node > build/bench-check.out 2>&1; then note "benchmark programs: checksums agree (scriptc, per-column reads, node)"; else note "benchmark programs: CHECKSUMS DIFFER (see build/bench-check.out)"; status=1; fi
+if node bench/run.mjs --check --only=scriptc,scriptc-packed,node > build/bench-check.out 2>&1; then note "benchmark programs: checksums agree (scriptc, packed reads, node)"; else note "benchmark programs: CHECKSUMS DIFFER (see build/bench-check.out)"; status=1; fi
 
 size() { wc -c < "$1" | tr -d ' '; }
 cp build/bin/test build/bin/test-stripped

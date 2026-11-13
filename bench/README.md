@@ -5,7 +5,7 @@ The same SQLite workloads in seven forms, so the scriptc build can be compared w
 | implementation | code | SQLite |
 |---|---|---|
 | scriptc | `sqlite-bench.mts`, compiled with `bin/scriptc-sqlite.mjs` | compiled in by `build.sh` |
-| scriptc (per-column reads) | the same binary with `SCRIPTC_SQLITE_ROW_READS=columns` (the older read path, one or two FFI calls per value) | same |
+| scriptc (packed reads) | the same binary with `SCRIPTC_SQLITE_ROW_READS=packed` (one FFI call per row that copies the whole row into a buffer; measured slower than the default per-value reads) | same |
 | Node | `sqlite-bench.mts` under Node 24 (`node:sqlite`) | bundled with Node |
 | Deno | `sqlite-bench.mts` under Deno 2 (`node:sqlite`, through the package's `#sqlite` import) | bundled with Deno |
 | Bun | `bun-bench.ts` (`bun:sqlite`) | bundled on Linux; **the system's SQLite on macOS** |
@@ -32,12 +32,12 @@ Needs Node 24, `npm ci` (scriptc), and clang (scriptc links with it; it also bui
 
 ```console
 $ node bench/run.mjs                     # all, 15 timed runs after 2 warm-ups each
-$ node bench/run.mjs --runs=5 --only=scriptc,scriptc-columns,node --workloads=read,text
+$ node bench/run.mjs --runs=5 --only=scriptc,scriptc-packed,node --workloads=read,text
 $ node bench/run.mjs --n=read=200000     # change N per workload
 $ node bench/run.mjs --check             # small N, one run each, checksums only, no timings
 ```
 
-Results go to `bench/results/<platform>.json` (every run) and `<platform>.md` (the tables). Implementation ids for `--only`: `scriptc`, `scriptc-columns`, `node`, `deno`, `bun`, `go`, `rust`.
+Results go to `bench/results/<platform>.json` (every run) and `<platform>.md` (the tables). Implementation ids for `--only`: `scriptc`, `scriptc-packed`, `node`, `deno`, `bun`, `go`, `rust`.
 
 In CI: Actions → Benchmark → Run workflow (`.github/workflows/bench.yml`). It runs `--check`, then the benchmark, on Linux x64, Linux arm64 and macOS arm64. The tables land in the job summary and `bench/results/` is uploaded as an artifact.
 

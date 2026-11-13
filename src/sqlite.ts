@@ -24,6 +24,8 @@ declare function sqxErrstr(code: number, out: Uint8Array): bigint;
 declare function sqxInTransaction(db: bigint): number;
 declare function sqxChanges(db: bigint): bigint;
 declare function sqxLastInsertRowid(db: bigint): bigint;
+declare function sqxChangesF64(db: bigint): number;
+declare function sqxLastInsertRowidF64(db: bigint): number;
 declare function sqxPrepare(db: bigint, sql: string): bigint;
 declare function sqxPrepareRc(): number;
 declare function sqxFinalize(stmt: bigint): number;
@@ -49,7 +51,7 @@ declare function sqxColumnText(stmt: bigint, index: number, out: Uint8Array): nu
 declare function sqxColumnBlob(stmt: bigint, index: number, out: Uint8Array): number;
 declare function sqxVersion(out: Uint8Array): bigint;
 declare function sqxRow(stmt: bigint, out: Uint8Array): number;
-declare function sqxColumnsMode(): number;
+declare function sqxPackedMode(): number;
 declare function sqxGetenv(name: string, out: Uint8Array): bigint;
 declare function sqxSerialize(db: bigint, schema: string): bigint;
 declare function sqxSerializedTake(out: Uint8Array): void;
@@ -231,15 +233,17 @@ function returnArraysError(): SQLiteError {
 // fetched again into a buffer of at least that size.
 let scratch = new Uint8Array(256);
 
-// Rows are read packed: one FFI call steps the statement and copies every
-// value of the row into rowBuffer (format in native/shim.c, sqx_row).
-// SCRIPTC_SQLITE_ROW_READS=columns reads them the day-1 way instead, one or
-// two calls per value, so a benchmark can compare the two in one binary.
-// (The C side reads the variable: process.env costs about 10 MiB per
-// thread in scriptc 0.4.12.)
+// Rows are read one value at a time: a call for the type and one for the
+// value. SCRIPTC_SQLITE_ROW_READS=packed reads them packed instead (one
+// FFI call steps and copies the whole row into rowBuffer; format in
+// native/shim.c, sqx_row), so a benchmark can compare the two in one
+// binary. Packed reads measured slower: FFI calls are cheap in scriptc
+// (a few nanoseconds), and packing walks each row twice in C and again
+// in TypeScript. (The C side reads the variable: process.env costs about
+// 10 MiB per thread in scriptc 0.4.12.)
 let rowBuffer = new Uint8Array(4096);
 let rowView = new DataView(rowBuffer.buffer);
-const packedRows = sqxColumnsMode() === 0;
+const packedRows = sqxPackedMode() === 1;
 
 /** UTF-8 bytes as a string. A new TextDecoder per call is deliberate: in
  * scriptc 0.4.12 decoding through one reused decoder costs about three
@@ -676,9 +680,21 @@ export class DatabaseSync {
   #generation = 0;
   /** Idle compiled statements by SQL text, oldest first. */
   #pool: Map<string, bigint[]> = new Map();
+  // The most recently released statement, outside the map: a statement
+  // run in a loop comes back here and is taken again with one string
+  // comparison, instead of map operations that hash its SQL. Counted in
+  // #pooled; always the newest idle statement.
+  #hotSql = "";
+  #hotStmt: bigint = NULL_HANDLE;
   #pooled = 0;
   /** Compiled statements a call or an iterator holds right now. */
-  #lent: Set<bigint> = new Set();
+  // Statements lent out right now (run, get, all, an open iterator), for
+  // close() and deserialize() to finalize. An array, not a set: they come
+  // back almost always in reverse order, so giving one back is a pop()
+  // rather than hashing a bigint twice per run(). (Not sqlite3_next_stmt
+  // in C: extensions such as FTS5 keep statements of their own on the
+  // connection and finalize those themselves.)
+  #lent: bigint[] = [];
 
   constructor(path: string, options?: DatabaseSyncOptions) {
     if (typeof path !== "string")
@@ -773,11 +789,14 @@ export class DatabaseSync {
   }
 
   #finalizeAll(): void {
+    if (this.#hotStmt !== NULL_HANDLE) sqxFinalize(this.#hotStmt);
     for (const handles of this.#pool.values()) for (const stmt of handles) sqxFinalize(stmt);
     for (const stmt of this.#lent) sqxFinalize(stmt);
     this.#pool = new Map();
+    this.#hotStmt = NULL_HANDLE;
+    this.#hotSql = "";
     this.#pooled = 0;
-    this.#lent = new Set();
+    this.#lent = [];
   }
 
   [Symbol.dispose](): void {
@@ -884,7 +903,7 @@ export class DatabaseSync {
     // compiled statement goes to the pool for the first call to use.
     const stmt = this._acquire(sql);
     const text = readText((out) => sqxSql(stmt, out));
-    this._release(sql, stmt);
+    this._release(sql, stmt, this.#generation);
     return new StatementSync(this, sql, text, this.#generation, { ...this.#defaults });
   }
 
@@ -909,6 +928,13 @@ export class DatabaseSync {
   /** @internal Borrow a compiled statement for `sql`. */
   _acquire(sql: string): bigint {
     const db = this.#handle();
+    if (this.#hotStmt !== NULL_HANDLE && this.#hotSql === sql) {
+      const hot = this.#hotStmt;
+      this.#hotStmt = NULL_HANDLE;
+      this.#pooled--;
+      this.#lent.push(hot);
+      return hot;
+    }
     const idle = this.#pool.get(sql);
     let stmt = NULL_HANDLE;
     if (idle !== undefined && idle.length > 0) {
@@ -922,17 +948,43 @@ export class DatabaseSync {
       if (stmt === NULL_HANDLE)
         throw new SQLiteError("The SQL query contains no statements.", "ERR_INVALID_ARG_VALUE");
     }
-    this.#lent.add(stmt);
+    this.#lent.push(stmt);
     return stmt;
   }
 
   /** @internal Give a borrowed statement back: reset, bindings cleared,
    * kept for reuse unless the pool is full. */
-  _release(sql: string, stmt: bigint): void {
-    if (!this.#lent.delete(stmt)) return; // finalized by close() meanwhile
+  /** @internal Gives back a statement from _acquire. `generation` is the
+   * one the caller checked before acquiring it. */
+  _release(sql: string, stmt: bigint, generation: number): void {
+    // Finalized meanwhile by close() or deserialize().
+    if (generation !== this.#generation || this.#db === NULL_HANDLE) return;
+    const lent = this.#lent;
+    let at = lent.length - 1;
+    while (at >= 0 && lent[at] !== stmt) at--;
+    if (at < 0) return;
+    if (at === lent.length - 1) lent.pop();
+    else lent.splice(at, 1);
     sqxReset(stmt);
-    if (this.#pooled >= POOL_LIMIT) {
-      // Drop the oldest idle statement to make room.
+    // The newest idle statement goes in the hot slot; the one there before
+    // moves to the map, as the newest entry there.
+    const hot = this.#hotStmt;
+    const hotSql = this.#hotSql;
+    this.#hotStmt = stmt;
+    this.#hotSql = sql;
+    this.#pooled++;
+    if (hot !== NULL_HANDLE) {
+      const idle = this.#pool.get(hotSql);
+      if (idle !== undefined) {
+        // Move the key to the newest end.
+        this.#pool.delete(hotSql);
+        idle.push(hot);
+        this.#pool.set(hotSql, idle);
+      } else this.#pool.set(hotSql, [hot]);
+    }
+    if (this.#pooled > POOL_LIMIT) {
+      // Drop the oldest idle statement (never the hot one: the map then
+      // holds all the others).
       for (const [oldSql, handles] of this.#pool) {
         sqxFinalize(handles.shift()!);
         this.#pooled--;
@@ -940,19 +992,11 @@ export class DatabaseSync {
         break;
       }
     }
-    const idle = this.#pool.get(sql);
-    if (idle !== undefined) {
-      // Move the key to the newest end.
-      this.#pool.delete(sql);
-      idle.push(stmt);
-      this.#pool.set(sql, idle);
-    } else this.#pool.set(sql, [stmt]);
-    this.#pooled++;
   }
 
   /** @internal For tests: compiled statements kept or lent right now. */
   _statementCount(): number {
-    return this.#pooled + this.#lent.size;
+    return this.#pooled + this.#lent.length;
   }
 
   #handle(): bigint {
@@ -976,6 +1020,7 @@ export class StatementSync {
   // once: the same SQL always has the same parameters, whichever pooled
   // statement runs it, so bind() need not ask SQLite for names per call.
   #anonymous: number[] | null = null;
+  #paramCount = -1;
 
   /** @internal Use DatabaseSync.prototype.prepare. */
   constructor(db: DatabaseSync, sql: string, text: string, generation: number, settings: StatementSettings) {
@@ -998,7 +1043,7 @@ export class StatementSync {
       if (this.#lastParams !== null) this.#bind(stmt, this.#lastParams);
       return readText((out) => sqxExpandedSql(stmt, out));
     } finally {
-      this.#db._release(this.#sql, stmt);
+      this.#db._release(this.#sql, stmt, this.#generation);
     }
   }
 
@@ -1040,7 +1085,7 @@ export class StatementSync {
       }
       return out;
     } finally {
-      this.#db._release(this.#sql, stmt);
+      this.#db._release(this.#sql, stmt, this.#generation);
     }
   }
 
@@ -1051,12 +1096,10 @@ export class StatementSync {
       let rc = sqxStep(stmt);
       while (rc === SQLITE_ROW) rc = sqxStep(stmt);
       if (rc !== SQLITE_DONE) throw stepError(db, rc);
-      const changes = sqxChanges(db);
-      const rowid = sqxLastInsertRowid(db);
-      if (this.#settings.readBigInts) return { changes, lastInsertRowid: rowid };
-      return { changes: Number(changes), lastInsertRowid: Number(rowid) };
+      if (this.#settings.readBigInts) return { changes: sqxChanges(db), lastInsertRowid: sqxLastInsertRowid(db) };
+      return { changes: sqxChangesF64(db), lastInsertRowid: sqxLastInsertRowidF64(db) };
     } finally {
-      this.#db._release(this.#sql, stmt);
+      this.#db._release(this.#sql, stmt, this.#generation);
     }
   }
 
@@ -1066,7 +1109,7 @@ export class StatementSync {
       const row = this.#next(stmt, []);
       return row === null ? undefined : row;
     } finally {
-      this.#db._release(this.#sql, stmt);
+      this.#db._release(this.#sql, stmt, this.#generation);
     }
   }
 
@@ -1078,7 +1121,7 @@ export class StatementSync {
       for (let row = this.#next(stmt, names); row !== null; row = this.#next(stmt, names)) rows.push(row);
       return rows;
     } finally {
-      this.#db._release(this.#sql, stmt);
+      this.#db._release(this.#sql, stmt, this.#generation);
     }
   }
 
@@ -1087,7 +1130,7 @@ export class StatementSync {
     try {
       return new StatementIterator(this, stmt, [], this.#calls);
     } catch (error) {
-      this.#db._release(this.#sql, stmt);
+      this.#db._release(this.#sql, stmt, this.#generation);
       throw error;
     }
   }
@@ -1111,7 +1154,7 @@ export class StatementSync {
 
   /** @internal An iterator is done with its statement. */
   _finish(stmt: bigint): void {
-    this.#db._release(this.#sql, stmt);
+    this.#db._release(this.#sql, stmt, this.#generation);
   }
 
   #check(): void {
@@ -1127,7 +1170,7 @@ export class StatementSync {
     try {
       this.#bind(stmt, params);
     } catch (error) {
-      this.#db._release(this.#sql, stmt);
+      this.#db._release(this.#sql, stmt, this.#generation);
       throw error;
     }
     this.#lastParams = params;
@@ -1136,7 +1179,11 @@ export class StatementSync {
 
   #bind(stmt: bigint, params: unknown[]): void {
     let first = 0;
-    const count = sqxParamCount(stmt);
+    let count = this.#paramCount;
+    if (count < 0) {
+      count = sqxParamCount(stmt);
+      this.#paramCount = count;
+    }
     const head = params.length > 0 ? params[0] : undefined;
     if (head !== null && typeof head === "object" && !(head instanceof Uint8Array)) {
       first = 1;

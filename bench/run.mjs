@@ -111,13 +111,13 @@ const impls = [
     },
   },
   {
-    id: "scriptc-columns",
-    label: "scriptc (per-column reads)",
+    id: "scriptc-packed",
+    label: "scriptc (packed reads)",
     available: () => found("clang"),
     missing: "clang",
     build: () => (existsSync(scriptcExe) ? null : "needs the scriptc build"),
-    command: (w, db, n) => [scriptcExe, [w, db, String(n)], { SCRIPTC_SQLITE_ROW_READS: "columns" }],
-    version: () => "same binary, SCRIPTC_SQLITE_ROW_READS=columns",
+    command: (w, db, n) => [scriptcExe, [w, db, String(n)], { SCRIPTC_SQLITE_ROW_READS: "packed" }],
+    version: () => "same binary, SCRIPTC_SQLITE_ROW_READS=packed",
     size: () => null,
   },
   {
@@ -250,7 +250,7 @@ for (const impl of impls) {
     notes.push(`${impl.label}: skipped, ${impl.missing} not found`);
     continue;
   }
-  if (flag("no-build") === undefined || impl.id === "scriptc-columns") {
+  if (flag("no-build") === undefined || impl.id === "scriptc-packed") {
     process.stderr.write(`building ${impl.label}\n`);
     const error = impl.build();
     if (error !== null) {
