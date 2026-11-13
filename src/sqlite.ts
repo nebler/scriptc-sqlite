@@ -63,31 +63,32 @@ declare function sqxBackupErrcode(backup: bigint): number;
 declare function sqxBackupErrmsg(backup: bigint, out: Uint8Array): bigint;
 declare function sqxBackupFinish(backup: bigint): void;
 declare function sqxStepRow(stmt: bigint, out: Uint8Array): bigint;
-declare function sqxSetDispatch(
-  fn: (op: number, id: bigint, ctx: bigint, argc: number, argv: bigint) => number,
-): void;
-declare function sqxCreateFunction(db: bigint, name: string, argc: number, flags: number, id: bigint): number;
+declare function sqxSetDispatch(fn: (op: number, id: number, argc: number) => number): void;
+declare function sqxCreateFunction(db: bigint, name: string, argc: number, flags: number, id: number): number;
 declare function sqxCreateAggregate(
   db: bigint,
   name: string,
   argc: number,
   flags: number,
-  id: bigint,
+  id: number,
   window: number,
 ): number;
-declare function sqxAggSlot(ctx: bigint): bigint;
-declare function sqxAggSetSlot(ctx: bigint, value: bigint): void;
-declare function sqxValueType(argv: bigint, index: number): number;
-declare function sqxValueInt64(argv: bigint, index: number): bigint;
-declare function sqxValueDouble(argv: bigint, index: number): number;
-declare function sqxValueText(argv: bigint, index: number, out: Uint8Array): bigint;
-declare function sqxValueBlob(argv: bigint, index: number, out: Uint8Array): bigint;
-declare function sqxResultNull(ctx: bigint): void;
-declare function sqxResultDouble(ctx: bigint, value: number): void;
-declare function sqxResultInt64(ctx: bigint, value: bigint): void;
-declare function sqxResultText(ctx: bigint, value: string): void;
-declare function sqxResultBlob(ctx: bigint, value: Uint8Array): void;
-declare function sqxResultError(ctx: bigint, message: string): void;
+// User-defined function callbacks: the shim keeps the current call's
+// context and arguments, so these take no pointers (see native/shim.c).
+declare function sqxAggSlot(): number;
+declare function sqxAggSetSlot(value: number): void;
+declare function sqxValueType(index: number): number;
+declare function sqxValueInt64(index: number): bigint;
+declare function sqxValueDouble(index: number): number;
+declare function sqxValueSafeInt(index: number): number;
+declare function sqxValueText(index: number, out: Uint8Array): bigint;
+declare function sqxValueBlob(index: number, out: Uint8Array): bigint;
+declare function sqxResultNull(): void;
+declare function sqxResultDouble(value: number): void;
+declare function sqxResultInt64(value: bigint): void;
+declare function sqxResultText(value: string): void;
+declare function sqxResultBlob(value: Uint8Array): void;
+declare function sqxResultError(message: string): void;
 
 export type SQLInputValue = null | number | bigint | string | Uint8Array | boolean;
 export type SQLOutputValue = null | number | bigint | string | Uint8Array;
@@ -236,8 +237,15 @@ let scratch = new Uint8Array(256);
 // (The C side reads the variable: process.env costs about 10 MiB per
 // thread in scriptc 0.4.12.)
 let rowBuffer = new Uint8Array(4096);
+let rowView = new DataView(rowBuffer.buffer);
 const packedRows = sqxColumnsMode() === 0;
-const decoder = new TextDecoder();
+
+/** UTF-8 bytes as a string. A new TextDecoder per call is deliberate: in
+ * scriptc 0.4.12 decoding through one reused decoder costs about three
+ * times as much (it keeps streaming state between calls). */
+function utf8(bytes: Uint8Array): string {
+  return new TextDecoder().decode(bytes);
+}
 
 function fetchInto(fetch: (out: Uint8Array) => bigint): number {
   let n = Number(fetch(scratch));
@@ -250,18 +258,56 @@ function fetchInto(fetch: (out: Uint8Array) => bigint): number {
 
 function readText(fetch: (out: Uint8Array) => bigint): string {
   const n = fetchInto(fetch);
-  return n <= 0 ? "" : decoder.decode(scratch.subarray(0, n));
+  return n <= 0 ? "" : utf8(scratch.subarray(0, n));
 }
 
 /** Like readText, but null where the C side answers -1 (no value). */
 function readTextOrNull(fetch: (out: Uint8Array) => bigint): string | null {
   const n = fetchInto(fetch);
   if (n < 0) return null;
-  return n === 0 ? "" : decoder.decode(scratch.subarray(0, n));
+  return n === 0 ? "" : utf8(scratch.subarray(0, n));
 }
 
 function readBytes(fetch: (out: Uint8Array) => bigint): Uint8Array {
   const n = fetchInto(fetch);
+  return n <= 0 ? new Uint8Array(0) : scratch.slice(0, n);
+}
+
+// The same as readText/readBytes for the hottest reads, written out
+// without a callback: a closure per value is measurable in scriptc.
+function columnText(stmt: bigint, i: number): string {
+  let n = Number(sqxColumnText(stmt, i, scratch));
+  if (n > scratch.length) {
+    scratch = new Uint8Array(Math.max(n, scratch.length * 2));
+    n = Number(sqxColumnText(stmt, i, scratch));
+  }
+  return n <= 0 ? "" : utf8(scratch.subarray(0, n));
+}
+
+function columnBlob(stmt: bigint, i: number): Uint8Array {
+  let n = Number(sqxColumnBlob(stmt, i, scratch));
+  if (n > scratch.length) {
+    scratch = new Uint8Array(Math.max(n, scratch.length * 2));
+    n = Number(sqxColumnBlob(stmt, i, scratch));
+  }
+  return n <= 0 ? new Uint8Array(0) : scratch.slice(0, n);
+}
+
+function valueText(i: number): string {
+  let n = Number(sqxValueText(i, scratch));
+  if (n > scratch.length) {
+    scratch = new Uint8Array(Math.max(n, scratch.length * 2));
+    n = Number(sqxValueText(i, scratch));
+  }
+  return n <= 0 ? "" : utf8(scratch.subarray(0, n));
+}
+
+function valueBlob(i: number): Uint8Array {
+  let n = Number(sqxValueBlob(i, scratch));
+  if (n > scratch.length) {
+    scratch = new Uint8Array(Math.max(n, scratch.length * 2));
+    n = Number(sqxValueBlob(i, scratch));
+  }
   return n <= 0 ? new Uint8Array(0) : scratch.slice(0, n);
 }
 
@@ -321,10 +367,10 @@ interface Group {
   window: boolean;
 }
 
-const registered: Map<bigint, Registered> = new Map();
-const groups: Map<bigint, Group> = new Map();
-let nextFunctionId = 0n;
-let nextGroupId = 0n;
+const registered: Map<number, Registered> = new Map();
+const groups: Map<number, Group> = new Map();
+let nextFunctionId = 0;
+let nextGroupId = 0;
 let dispatchSet = false;
 let callbackFailed = false;
 let callbackError: unknown = undefined;
@@ -351,37 +397,36 @@ function clearCallbackError(): void {
   callbackError = undefined;
 }
 
-function dispatch(op: number, id: bigint, ctx: bigint, argc: number, argv: bigint): number {
+function dispatch(op: number, id: number, argc: number): number {
   if (op === OP_DESTROY) {
     registered.delete(id);
     return 1;
   }
   callbackDepth++;
   try {
-    return dispatchCall(op, id, ctx, argc, argv);
+    return dispatchCall(op, id, argc);
   } finally {
     callbackDepth--;
   }
 }
 
-function dispatchCall(op: number, id: bigint, ctx: bigint, argc: number, argv: bigint): number {
+function dispatchCall(op: number, id: number, argc: number): number {
   try {
     const entry = registered.get(id);
     if (entry === undefined) {
-      sqxResultError(ctx, "user-defined function is no longer defined");
+      sqxResultError("user-defined function is no longer defined");
       return 1;
     }
     if (op === OP_FUNC) {
-      setResult(ctx, (entry.fn as AnyCall)(...functionArguments(argc, argv, entry.bigints)));
+      setResult(callFunction(entry.fn as AnyCall, argc, entry.bigints));
       return 1;
     }
-    const slot = groupSlot(ctx, entry);
-    if (slot < 0n) return 1;
+    const slot = groupSlot(entry);
+    if (slot < 0) return 1;
     const group = groups.get(slot)!;
     if (op === OP_STEP || op === OP_INVERSE) {
-      const args = functionArguments(argc, argv, entry.bigints);
       const fn = op === OP_STEP ? entry.fn : entry.inverse;
-      group.value = (fn as AnyCall)(group.value, ...args);
+      group.value = callStep(fn as AnyCall, group.value, argc, entry.bigints);
       return 1;
     }
     // OP_VALUE or OP_FINAL. Node gives no result from xFinal once the
@@ -392,7 +437,7 @@ function dispatchCall(op: number, id: bigint, ctx: bigint, argc: number, argv: b
       return 1;
     }
     try {
-      setResult(ctx, entry.result !== undefined ? (entry.result as AnyCall)(group.value) : group.value);
+      setResult(entry.result !== undefined ? (entry.result as AnyCall)(group.value) : group.value);
     } finally {
       if (op === OP_FINAL) groups.delete(slot);
     }
@@ -412,50 +457,74 @@ function dispatchCall(op: number, id: bigint, ctx: bigint, argc: number, argv: b
 
 /** The slot of the group SQLite is aggregating, set up with the start
  * value on first use; -1 after setting an error result. */
-function groupSlot(ctx: bigint, entry: Registered): bigint {
-  const slot = sqxAggSlot(ctx);
-  if (slot !== 0n) {
-    if (slot < 0n) sqxResultError(ctx, "out of memory");
+function groupSlot(entry: Registered): number {
+  const slot = sqxAggSlot();
+  if (slot !== 0) {
+    if (slot < 0) sqxResultError("out of memory");
     return slot;
   }
   const start = typeof entry.start === "function" ? (entry.start as AnyCall)() : entry.start;
   const created = ++nextGroupId;
   groups.set(created, { value: start, window: false });
-  sqxAggSetSlot(ctx, created);
+  sqxAggSetSlot(created);
   return created;
 }
 
-function functionArguments(argc: number, argv: bigint, bigints: boolean): SQLOutputValue[] {
-  const args: SQLOutputValue[] = [];
-  for (let i = 0; i < argc; i++) {
-    const type = sqxValueType(argv, i);
-    if (type === SQLITE_INTEGER) {
-      const value = sqxValueInt64(argv, i);
-      if (bigints) args.push(value);
-      else if (value > MAX_SAFE || value < -MAX_SAFE)
-        throw new SQLiteError(`Value is too large to be represented as a JavaScript number: ${value}`, "ERR_OUT_OF_RANGE");
-      else args.push(Number(value));
-    } else if (type === SQLITE_FLOAT) args.push(sqxValueDouble(argv, i));
-    else if (type === SQLITE_TEXT) args.push(readText((out) => sqxValueText(argv, i, out)));
-    else if (type === SQLITE_BLOB) args.push(readBytes((out) => sqxValueBlob(argv, i, out)));
-    else args.push(null);
+function functionArgument(i: number, bigints: boolean): SQLOutputValue {
+  const type = sqxValueType(i);
+  if (type === SQLITE_INTEGER) {
+    if (bigints) return sqxValueInt64(i);
+    const value = sqxValueSafeInt(i);
+    if (value !== value) {
+      const big = sqxValueInt64(i);
+      throw new SQLiteError(`Value is too large to be represented as a JavaScript number: ${big}`, "ERR_OUT_OF_RANGE");
+    }
+    return value;
   }
+  if (type === SQLITE_FLOAT) return sqxValueDouble(i);
+  if (type === SQLITE_TEXT) return valueText(i);
+  if (type === SQLITE_BLOB) return valueBlob(i);
+  return null;
+}
+
+function functionArguments(argc: number, bigints: boolean): SQLOutputValue[] {
+  const args: SQLOutputValue[] = [];
+  for (let i = 0; i < argc; i++) args.push(functionArgument(i, bigints));
   return args;
+}
+
+/** fn(...arguments) without building and spreading an array for the
+ * common small counts (a spread call is several times slower in scriptc). */
+function callFunction(fn: AnyCall, argc: number, bigints: boolean): unknown {
+  if (argc === 0) return fn();
+  if (argc === 1) return fn(functionArgument(0, bigints));
+  if (argc === 2) return fn(functionArgument(0, bigints), functionArgument(1, bigints));
+  if (argc === 3)
+    return fn(functionArgument(0, bigints), functionArgument(1, bigints), functionArgument(2, bigints));
+  return fn(...functionArguments(argc, bigints));
+}
+
+/** fn(state, ...arguments), likewise. */
+function callStep(fn: AnyCall, state: unknown, argc: number, bigints: boolean): unknown {
+  if (argc === 0) return fn(state);
+  if (argc === 1) return fn(state, functionArgument(0, bigints));
+  if (argc === 2) return fn(state, functionArgument(0, bigints), functionArgument(1, bigints));
+  return fn(state, ...functionArguments(argc, bigints));
 }
 
 /** A user function's return value as the SQL result, by Node's rules:
  * null and undefined → NULL, number → REAL, string → TEXT, Uint8Array →
  * BLOB, bigint → INTEGER. Anything else (booleans too) is an SQL error. */
-function setResult(ctx: bigint, value: unknown): void {
-  if (value === null || value === undefined) sqxResultNull(ctx);
-  else if (typeof value === "number") sqxResultDouble(ctx, value);
-  else if (typeof value === "string") sqxResultText(ctx, value);
-  else if (value instanceof Uint8Array) sqxResultBlob(ctx, value);
+function setResult(value: unknown): void {
+  if (value === null || value === undefined) sqxResultNull();
+  else if (typeof value === "number") sqxResultDouble(value);
+  else if (typeof value === "string") sqxResultText(value);
+  else if (value instanceof Uint8Array) sqxResultBlob(value);
   else if (typeof value === "bigint") {
-    if (value < INT64_MIN || value > INT64_MAX) sqxResultError(ctx, "BigInt value is too large for SQLite");
-    else sqxResultInt64(ctx, value);
-  } else if (value instanceof Promise) sqxResultError(ctx, "Asynchronous user-defined functions are not supported");
-  else sqxResultError(ctx, "Returned JavaScript value cannot be converted to a SQLite value");
+    if (value < INT64_MIN || value > INT64_MAX) sqxResultError("BigInt value is too large for SQLite");
+    else sqxResultInt64(value);
+  } else if (value instanceof Promise) sqxResultError("Asynchronous user-defined functions are not supported");
+  else sqxResultError("Returned JavaScript value cannot be converted to a SQLite value");
 }
 
 /** @internal For tests: user functions this thread keeps, and aggregate
@@ -894,6 +963,10 @@ export class StatementSync {
    * in Node, where the call resets the statement under it. */
   #calls = 0;
   #lastParams: unknown[] | null = null;
+  // The indexes of the anonymous parameters ("?", "?NNN"), in order, found
+  // once: the same SQL always has the same parameters, whichever pooled
+  // statement runs it, so bind() need not ask SQLite for names per call.
+  #anonymous: number[] | null = null;
 
   /** @internal Use DatabaseSync.prototype.prepare. */
   constructor(db: DatabaseSync, sql: string, text: string, generation: number, settings: StatementSettings) {
@@ -1069,12 +1142,19 @@ export class StatementSync {
       }
     }
     // Positional values fill the anonymous parameters ("?" and "?NNN") in
-    // order, skipping named ones, as node:sqlite does.
-    let index = 1;
+    // order, skipping named ones, as node:sqlite does. Values beyond them
+    // go to the indexes after the last parameter, where SQLite reports
+    // the range error.
+    if (first >= params.length) return;
+    let anonymous = this.#anonymous;
+    if (anonymous === null) {
+      anonymous = [];
+      for (let index = 1; index <= count; index++) if (paramName(stmt, index).startsWith("?")) anonymous.push(index);
+      this.#anonymous = anonymous;
+    }
     for (let i = first; i < params.length; i++) {
-      while (index <= count && !paramName(stmt, index).startsWith("?")) index++;
-      this.#bindOne(stmt, index, params[i]);
-      index++;
+      const k = i - first;
+      this.#bindOne(stmt, k < anonymous.length ? anonymous[k]! : count + 1 + (k - anonymous.length), params[i]);
     }
   }
 
@@ -1142,14 +1222,14 @@ export class StatementSync {
     if (n > buffer.length) {
       buffer = new Uint8Array(Math.max(n, buffer.length * 2));
       rowBuffer = buffer;
+      rowView = new DataView(buffer.buffer);
       n = Number(sqxRow(stmt, buffer));
     }
     if (names.length === 0) for (const name of this.#columnNames(stmt)) names.push(name);
-    return this.#unpack(buffer, names);
+    return this.#unpack(buffer, buffer === rowBuffer ? rowView : new DataView(buffer.buffer), names);
   }
 
-  #unpack(buffer: Uint8Array, names: string[]): SQLRow {
-    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  #unpack(buffer: Uint8Array, view: DataView, names: string[]): SQLRow {
     // Rows have no prototype, as in Node.
     const row = Object.create(null) as SQLRow;
     let at = 0;
@@ -1176,7 +1256,7 @@ export class StatementSync {
       } else if (type === SQLITE_TEXT || type === SQLITE_BLOB) {
         const length = view.getUint32(at, true);
         at += 4;
-        if (type === SQLITE_TEXT) value = length === 0 ? "" : decoder.decode(buffer.subarray(at, at + length));
+        if (type === SQLITE_TEXT) value = length === 0 ? "" : utf8(buffer.subarray(at, at + length));
         else value = buffer.slice(at, at + length);
         at += length;
       }
@@ -1205,8 +1285,8 @@ export class StatementSync {
       return Number(value);
     }
     if (type === SQLITE_FLOAT) return sqxColumnDouble(stmt, i);
-    if (type === SQLITE_TEXT) return readText((out) => sqxColumnText(stmt, i, out));
-    if (type === SQLITE_BLOB) return readBytes((out) => sqxColumnBlob(stmt, i, out));
+    if (type === SQLITE_TEXT) return columnText(stmt, i);
+    if (type === SQLITE_BLOB) return columnBlob(stmt, i);
     return null;
   }
 }

@@ -11,6 +11,7 @@
  * keeps state between calls except thread-local values (the last prepare
  * code, the user-function dispatcher), so connections and statements may
  * live on any scriptc thread, one thread at a time each. */
+#include <math.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -428,9 +429,18 @@ int64_t sqx_step_row(void *stmt, uint8_t *out, size_t cap) {
  * with an empty error message, which TypeScript replaces with that
  * exception (as Node does). A dispatcher that throws is seen here as 0. */
 enum { SQX_FUNC = 0, SQX_STEP = 1, SQX_INVERSE = 2, SQX_VALUE = 3, SQX_FINAL = 4, SQX_DESTROY = 5 };
-typedef int32_t (*sqx_dispatch_fn)(int32_t op, int64_t id, void *ctx, int32_t argc, void *argv, void *user);
+/* The callback gets plain numbers only: a pointer reaches TypeScript as a
+ * bigint, which scriptc allocates, and these run once per row. The call's
+ * context and arguments stay here, in thread-locals that the sqx_value_*,
+ * sqx_result_* and sqx_agg_* functions use. They are saved and restored
+ * around each call, so a function that runs a query that calls another
+ * function finds its own again afterwards. `id` is a double so that ids
+ * and group slots never wrap (exact up to 2^53). */
+typedef int32_t (*sqx_dispatch_fn)(int32_t op, double id, int32_t argc, void *user);
 static _Thread_local sqx_dispatch_fn dispatch_fn;
 static _Thread_local void *dispatch_user;
+static _Thread_local sqlite3_context *cur_ctx;
+static _Thread_local sqlite3_value **cur_argv;
 
 void sqx_set_dispatch(sqx_dispatch_fn fn, void *user) {
   dispatch_fn = fn;
@@ -443,7 +453,14 @@ static void call_dispatch(int op, sqlite3_context *ctx, int argc, sqlite3_value 
     sqlite3_result_error(ctx, "user-defined function called on a thread that did not define it", -1);
     return;
   }
-  if (dispatch_fn(op, id, ctx, argc, argv, dispatch_user) != 1) sqlite3_result_error(ctx, "", 0);
+  sqlite3_context *saved_ctx = cur_ctx;
+  sqlite3_value **saved_argv = cur_argv;
+  cur_ctx = ctx;
+  cur_argv = argv;
+  int32_t ok = dispatch_fn(op, (double)id, argc, dispatch_user);
+  cur_ctx = saved_ctx;
+  cur_argv = saved_argv;
+  if (ok != 1) sqlite3_result_error(ctx, "", 0);
 }
 
 static void x_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) { call_dispatch(SQX_FUNC, ctx, argc, argv); }
@@ -457,97 +474,104 @@ static void x_final(sqlite3_context *ctx) { call_dispatch(SQX_FINAL, ctx, 0, NUL
 /* SQLite drops a function when it is replaced or the connection closes;
  * TypeScript then forgets it. Only ever on the thread that uses it. */
 static void x_destroy(void *p) {
-  if (dispatch_fn) dispatch_fn(SQX_DESTROY, (int64_t)(intptr_t)p, NULL, 0, NULL, dispatch_user);
+  if (dispatch_fn) dispatch_fn(SQX_DESTROY, (double)(int64_t)(intptr_t)p, 0, dispatch_user);
 }
 
 /* `name` is a UTF-8 span. `flags` holds SQLITE_DETERMINISTIC and
  * SQLITE_DIRECTONLY as TypeScript computed them; SQLITE_UTF8 is added here.
  * As SQLite does when registering fails, x_destroy runs if the name cannot
  * be copied, so TypeScript forgets the function either way. */
-int32_t sqx_create_function(void *db, const uint8_t *name, size_t name_len, int32_t argc, int32_t flags,
-                            int64_t id) {
+int32_t sqx_create_function(void *db, const uint8_t *name, size_t name_len, int32_t argc, int32_t flags, double id) {
+  void *user = (void *)(intptr_t)(int64_t)id;
   char *fname = span_dup(name, name_len);
   if (!fname) {
-    x_destroy((void *)(intptr_t)id);
+    x_destroy(user);
     return SQLITE_NOMEM;
   }
-  int rc = sqlite3_create_function_v2((sqlite3 *)db, fname, argc, SQLITE_UTF8 | flags, (void *)(intptr_t)id, x_func,
-                                      NULL, NULL, x_destroy);
+  int rc = sqlite3_create_function_v2((sqlite3 *)db, fname, argc, SQLITE_UTF8 | flags, user, x_func, NULL, NULL,
+                                      x_destroy);
   sqlite3_free(fname);
   return rc;
 }
 
 /* `window` (an aggregate with an inverse) registers xValue and xInverse. */
-int32_t sqx_create_aggregate(void *db, const uint8_t *name, size_t name_len, int32_t argc, int32_t flags, int64_t id,
+int32_t sqx_create_aggregate(void *db, const uint8_t *name, size_t name_len, int32_t argc, int32_t flags, double id,
                              int32_t window) {
+  void *user = (void *)(intptr_t)(int64_t)id;
   char *fname = span_dup(name, name_len);
   if (!fname) {
-    x_destroy((void *)(intptr_t)id);
+    x_destroy(user);
     return SQLITE_NOMEM;
   }
-  int rc = sqlite3_create_window_function((sqlite3 *)db, fname, argc, SQLITE_UTF8 | flags, (void *)(intptr_t)id,
-                                          x_step, x_final, window ? x_value : NULL, window ? x_inverse : NULL,
-                                          x_destroy);
+  int rc = sqlite3_create_window_function((sqlite3 *)db, fname, argc, SQLITE_UTF8 | flags, user, x_step, x_final,
+                                          window ? x_value : NULL, window ? x_inverse : NULL, x_destroy);
   sqlite3_free(fname);
   return rc;
 }
 
-/* An aggregate's per-group slot: a number TypeScript chooses to find the
- * group's state, kept in SQLite's aggregate context. 0 until set; -1 when
- * SQLite could not allocate the context. */
-int64_t sqx_agg_slot(void *ctx) {
-  int64_t *slot = sqlite3_aggregate_context((sqlite3_context *)ctx, (int)sizeof(int64_t));
-  return slot ? *slot : -1;
+/* The current aggregate group's slot: a number TypeScript chooses to find
+ * the group's state, kept in SQLite's aggregate context. 0 until set; -1
+ * when SQLite could not allocate the context. */
+double sqx_agg_slot(void) {
+  int64_t *slot = sqlite3_aggregate_context(cur_ctx, (int)sizeof(int64_t));
+  return slot ? (double)*slot : -1;
 }
 
-void sqx_agg_set_slot(void *ctx, int64_t value) {
-  int64_t *slot = sqlite3_aggregate_context((sqlite3_context *)ctx, (int)sizeof(int64_t));
-  if (slot) *slot = value;
+void sqx_agg_set_slot(double value) {
+  int64_t *slot = sqlite3_aggregate_context(cur_ctx, (int)sizeof(int64_t));
+  if (slot) *slot = (int64_t)value;
 }
 
-/* Arguments: argv is SQLite's sqlite3_value ** array; i is checked by
- * TypeScript against argc. Text and blobs as for columns: full length
- * returned, at most cap bytes copied; the value stays put while the
- * function runs. */
-static sqlite3_value *arg(void *argv, int32_t i) { return ((sqlite3_value **)argv)[i]; }
+/* The current call's arguments; i is checked by TypeScript against argc.
+ * Text and blobs as for columns: full length returned, at most cap bytes
+ * copied; the value stays put while the function runs. */
+static sqlite3_value *arg(int32_t i) { return cur_argv[i]; }
 
-int32_t sqx_value_type(void *argv, int32_t i) { return sqlite3_value_type(arg(argv, i)); }
-int64_t sqx_value_int64(void *argv, int32_t i) { return sqlite3_value_int64(arg(argv, i)); }
-double sqx_value_double(void *argv, int32_t i) { return sqlite3_value_double(arg(argv, i)); }
+int32_t sqx_value_type(int32_t i) { return sqlite3_value_type(arg(i)); }
+int64_t sqx_value_int64(int32_t i) { return sqlite3_value_int64(arg(i)); }
+double sqx_value_double(int32_t i) { return sqlite3_value_double(arg(i)); }
 
-int64_t sqx_value_text(void *argv, int32_t i, uint8_t *out, size_t cap) {
-  const unsigned char *t = sqlite3_value_text(arg(argv, i));
-  size_t n = (size_t)sqlite3_value_bytes(arg(argv, i));
+/* An integer argument as a double when it is within ±(2^53 - 1), where
+ * the two agree exactly; NaN otherwise (TypeScript then reads it as a
+ * bigint to report it). Saves allocating a bigint per argument. */
+double sqx_value_safe_int(int32_t i) {
+  int64_t v = sqlite3_value_int64(arg(i));
+  const int64_t max = 9007199254740991LL;
+  return v > max || v < -max ? NAN : (double)v;
+}
+
+int64_t sqx_value_text(int32_t i, uint8_t *out, size_t cap) {
+  const unsigned char *t = sqlite3_value_text(arg(i));
+  size_t n = (size_t)sqlite3_value_bytes(arg(i));
   return t ? copy_out(t, n, out, cap) : 0;
 }
 
-int64_t sqx_value_blob(void *argv, int32_t i, uint8_t *out, size_t cap) {
-  const void *b = sqlite3_value_blob(arg(argv, i));
-  size_t n = (size_t)sqlite3_value_bytes(arg(argv, i));
+int64_t sqx_value_blob(int32_t i, uint8_t *out, size_t cap) {
+  const void *b = sqlite3_value_blob(arg(i));
+  size_t n = (size_t)sqlite3_value_bytes(arg(i));
   return b ? copy_out(b, n, out, cap) : 0;
 }
 
-/* Results. As with binding, empty text and blobs are set explicitly, since
- * an empty span may arrive as a null pointer, which SQLite takes as NULL. */
-void sqx_result_null(void *ctx) { sqlite3_result_null((sqlite3_context *)ctx); }
-void sqx_result_double(void *ctx, double v) { sqlite3_result_double((sqlite3_context *)ctx, v); }
-void sqx_result_int64(void *ctx, int64_t v) { sqlite3_result_int64((sqlite3_context *)ctx, v); }
+/* Results of the current call. As with binding, empty text and blobs are
+ * set explicitly, since an empty span may arrive as a null pointer, which
+ * SQLite takes as NULL. */
+void sqx_result_null(void) { sqlite3_result_null(cur_ctx); }
+void sqx_result_double(double v) { sqlite3_result_double(cur_ctx, v); }
+void sqx_result_int64(int64_t v) { sqlite3_result_int64(cur_ctx, v); }
 
-void sqx_result_text(void *ctx, const uint8_t *p, size_t n) {
-  sqlite3_result_text64((sqlite3_context *)ctx, nonnull(p), (sqlite3_uint64)n, SQLITE_TRANSIENT, SQLITE_UTF8);
+void sqx_result_text(const uint8_t *p, size_t n) {
+  sqlite3_result_text64(cur_ctx, nonnull(p), (sqlite3_uint64)n, SQLITE_TRANSIENT, SQLITE_UTF8);
 }
 
-void sqx_result_blob(void *ctx, const uint8_t *p, size_t n) {
+void sqx_result_blob(const uint8_t *p, size_t n) {
   if (n == 0) {
-    sqlite3_result_zeroblob((sqlite3_context *)ctx, 0);
+    sqlite3_result_zeroblob(cur_ctx, 0);
     return;
   }
-  sqlite3_result_blob64((sqlite3_context *)ctx, p, (sqlite3_uint64)n, SQLITE_TRANSIENT);
+  sqlite3_result_blob64(cur_ctx, p, (sqlite3_uint64)n, SQLITE_TRANSIENT);
 }
 
-void sqx_result_error(void *ctx, const uint8_t *p, size_t n) {
-  sqlite3_result_error((sqlite3_context *)ctx, nonnull(p), (int)n);
-}
+void sqx_result_error(const uint8_t *p, size_t n) { sqlite3_result_error(cur_ctx, nonnull(p), (int)n); }
 
 /* The SQLite library version, for the notes. */
 int64_t sqx_version(uint8_t *out, size_t cap) {
