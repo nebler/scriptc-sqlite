@@ -2,10 +2,10 @@
 # Builds SQLite into a static archive for the machine's own target, plus the
 # shim, so a scriptc program links SQLite in and needs no system library.
 #
-#   . sqlite/env.sh && sh sqlite/build.sh
+#   sh build.sh
 #
-# Output: sqlite/build/lib/libsqlite3.a and libsqlite_shim.a, the archives
-# sqlite/ffi.json links. Linux arm64 only so far; see NOTES.md for macOS and
+# Output: build/lib/libsqlite3.a and libsqlite_shim.a, the archives
+# ffi.json links. Tested on Linux arm64 and macOS arm64; see NOTES.md for
 # Windows.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)

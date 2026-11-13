@@ -115,11 +115,14 @@ const putBig = db.prepare("insert into big values (?, ?)");
 putBig.run("max", 9223372036854775807n);
 putBig.run("min", -9223372036854775808n);
 putBig.run("past safe", 9007199254740993n);
+putBig.run("past safe neg", -9007199254740993n);
 putBig.run("small", 12n);
 const getBig = db.prepare("select v, typeof(v) t from big where k = ?");
-for (const k of ["max", "min", "past safe", "small"]) attempt(`read ${k} as number`, () => showRow(getBig.get(k) as Record<string, Value>));
+// "min" (-2^63) is left out as a number: Node itself answers differently on
+// Linux (rounds it) and macOS (refuses it), so it cannot be the reference.
+for (const k of ["max", "past safe", "past safe neg", "small"]) attempt(`read ${k} as number`, () => showRow(getBig.get(k) as Record<string, Value>));
 getBig.setReadBigInts(true);
-for (const k of ["max", "min", "past safe", "small"]) attempt(`read ${k} as bigint`, () => showRow(getBig.get(k) as Record<string, Value>));
+for (const k of ["max", "min", "past safe", "past safe neg", "small"]) attempt(`read ${k} as bigint`, () => showRow(getBig.get(k) as Record<string, Value>));
 attempt("bind 2^63", () => show(putBig.run("too big", 9223372036854775808n).changes));
 attempt("bind -2^63-1", () => show(putBig.run("too small", -9223372036854775809n).changes));
 attempt("sum overflow", () => showRow(db.prepare("select sum(v) s from big").get() as Record<string, Value>));

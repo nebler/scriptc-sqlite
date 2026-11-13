@@ -2,10 +2,10 @@
 # The whole check: every program under Node (node:sqlite) and as scriptc
 # binaries built through bin/scriptc-sqlite.mjs (the way another project
 # builds), release and sanitized, outputs compared byte for byte, plus
-# binary size and peak memory. No timings: this box's timings are not
-# results.
+# binary size and peak memory. No timings: these runs are checks,
+# not benchmarks.
 #
-#   . sqlite/env.sh && sh sqlite/run.sh
+#   npm ci && sh run.sh
 #
 # Writes build/*.out and build/summary.txt.
 set -eu
@@ -64,7 +64,7 @@ done
 
 # The example project, built as another project would build it.
 echo "building the example project"
-(cd example && npm run --silent build > ../build/example.build 2>&1) || status=1
+(cd example && npm ci --no-audit --no-fund > ../build/example.install 2>&1 && npm run --silent build > ../build/example.build 2>&1) || status=1
 rm -f build/tmp/notes.db
 mkdir -p build/tmp
 NOTES_DB=build/tmp/notes.db example/build/app add "first note ✓" > build/example.out
@@ -80,9 +80,16 @@ if [ "$(example/build/readme)" = "1 hello 🙂" ]; then note "README example: bu
 
 size() { wc -c < "$1" | tr -d ' '; }
 cp build/bin/test build/bin/test-stripped
-llvm-strip build/bin/test-stripped
+strip build/bin/test-stripped
 note "test binary bytes $(size build/bin/test), stripped $(size build/bin/test-stripped); example app bytes $(size example/build/app)"
-note "dynamic libraries of the test binary: $(llvm-readelf -d build/bin/test | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | tr '\n' ' ')"
+if [ "$(uname)" = Darwin ]; then
+  libs=$(otool -L build/bin/test | tail -n +2 | awk '{print $1}' | tr '\n' ' ')
+else
+  libs=$(readelf -d build/bin/test | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | tr '\n' ' ')
+fi
+note "dynamic libraries of the test binary: $libs"
+# SQLite must be compiled in, never taken from the system.
+case "$libs" in *sqlite*) note "FAIL: links a system SQLite"; status=1 ;; esac
 cat build/summary.txt
 if [ "$status" -eq 0 ]; then echo PASS; else echo "FAIL: see build/*.out and build/*.err"; fi
 exit $status

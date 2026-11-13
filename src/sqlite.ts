@@ -604,9 +604,10 @@ export class StatementSync {
     if (type === SQLITE_INTEGER) {
       const value = sqxColumnInt64(stmt, i);
       if (this.#settings.readBigInts) return value;
-      // Node 24 refuses only values above the safe range; values below it
-      // come back rounded. Copied as is, so results match.
-      if (value > MAX_SAFE)
+      // Node refuses values outside the safe range in both directions.
+      // (Node on Linux returns -2^63 itself rounded instead of refusing it,
+      // while Node on macOS refuses it; this module refuses it everywhere.)
+      if (value > MAX_SAFE || value < -MAX_SAFE)
         throw new SQLiteError(`Value is too large to be represented as a JavaScript number: ${value}`, "ERR_OUT_OF_RANGE");
       return Number(value);
     }

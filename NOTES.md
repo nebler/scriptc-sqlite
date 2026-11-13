@@ -1,6 +1,6 @@
 # SQLite for stock scriptc: notes
 
-Separate from the move work. Uses the published `scriptc@0.4.12` from npm (installed in this folder), not the fork.
+Uses the published `scriptc@0.4.12` from npm. Days 1 and 2 were built and checked in a Linux arm64 sandbox (gVisor); macOS arm64 was checked afterwards.
 
 ## Day 2, 13 November 2026: result
 
@@ -83,7 +83,7 @@ Not tested: ThreadSanitizer. The scriptc lane here is AddressSanitizer and LeakS
 - `test.mts` holds a 1 MiB blob and strings of 300,000 characters in memory at once, so its memory figure is mostly the test's own data. `small.mts` is the fairer figure for an ordinary program.
 - **Positive control:** a copy of the shim that writes one byte past the caller's buffer was built into the sanitized lane. AddressSanitizer stopped it at the first blob read with a heap-buffer-overflow in `sqx_column_blob`. So the lane does see the C side (`build/control/`, not part of `run.sh`).
 - **Binary size:** release test binary 2.54 MB, 2.29 MB stripped; the SQLite archive is 2.2 MB of that. It links only `libc.so.6` and `libm.so.6`: no system SQLite. The sanitized binary is 23 MB.
-- **No timings:** this box's timings are not results.
+- **No timings:** the sandbox's timings are not results.
 
 **What the test covers:**
 - Integers, floats, text, blobs and NULL in one table, each with `typeof()` and `length()`.
@@ -132,9 +132,9 @@ Not tested: ThreadSanitizer. The scriptc lane here is AddressSanitizer and LeakS
   - Reading: INTEGER → number or bigint, REAL → number, TEXT → string, BLOB → Uint8Array, NULL → null.
   - Errors carry Node's error codes.
 - **One test file for both runtimes:** `package.json` maps the import `#sqlite` to `./src/node-sqlite.ts` under the `node` condition (a one-line re-export of `node:sqlite`) and to `./src/sqlite.ts` by default. scriptc resolves with `types`/`import`/`default` and skips `node`. Node refuses `node:sqlite` itself as an imports target (`ERR_INVALID_PACKAGE_TARGET`), hence the re-export file.
-- **`run.sh`** builds everything and runs Node, release, sanitized and `small.mts`. It compares outputs with `cmp` and writes `build/summary.txt`. `tools/peakrss.c` measures peak memory, because the box has no `/usr/bin/time`.
+- **`run.sh`** builds everything and runs Node, release, sanitized and `small.mts`. It compares outputs with `cmp` and writes `build/summary.txt`. `tools/peakrss.c` measures peak memory, because the sandbox had no `/usr/bin/time`.
 
-To reproduce, from the top of the workspace: `. sqlite/env.sh && sh sqlite/run.sh` (about 4 minutes here, most of it the two SQLite compiles). `cd sqlite && npm ci` first in a fresh checkout.
+To reproduce: `npm ci && sh run.sh` (about 4 minutes here, most of it the two SQLite compiles).
 
 ## What got in the way in the FFI
 
@@ -147,9 +147,9 @@ To reproduce, from the top of the workspace: `. sqlite/env.sh && sh sqlite/run.s
    - The open code is read back from the handle (`sqx_open_failed`). The prepare code goes through a thread-local side channel (`sqx_prepare_rc`), because a NULL statement can mean either an error or empty SQL.
    - Small, but every C API with out-parameters needs such a wrapper.
 3. **Empty spans may arrive as a null pointer.** SQLite binds a null pointer as NULL, so the shim binds empty text and empty blobs explicitly. Without that, empty strings came back as NULL. The docs do say this ("an empty span may have a null pointer"), but it is an easy trap.
-4. **`--lib` builds have no outbound FFI** (docs). So this cannot ship as a ready-made scriptc library: every program that uses it must pass `--ffi sqlite/ffi.json` at build time, and the manifest's paths are relative to the manifest. That is a packaging question for day 2.
+4. **`--lib` builds have no outbound FFI** (docs). So this cannot ship as a ready-made scriptc library: every program that uses it must pass `--ffi ffi.json` at build time, and the manifest's paths are relative to the manifest. That is a packaging question for day 2.
 5. **Variadic C** (`sqlite3_db_config`) has to be called from the shim. That was already planned; the docs say so.
-6. **Toolchain:** the published scriptc needs `clang` on PATH to link (`SC3004 spawnSync clang ENOENT` otherwise). Here that is the box's LLVM 22, via `sqlite/env.sh`.
+6. **Toolchain:** the published scriptc needs `clang` on PATH to link (`SC3004 spawnSync clang ENOENT` otherwise). In the sandbox that was LLVM 22; on macOS, Xcode's clang works.
    - npm blocked scriptc's postinstall (`allowScripts`), and I ran `scripts/install-native.mjs` by hand before the first build. `scriptc --version` worked without it; I did not test whether builds do.
 7. **Not the FFI, but met in the test:** scriptc refuses dot access on index-signature types (`row.x` on a `Record`, SC1090), so the test uses `row["x"]`.
 
@@ -182,7 +182,6 @@ To reproduce, from the top of the workspace: `. sqlite/env.sh && sh sqlite/run.s
 - `pool.mts`: the statement pool (scriptc only).
 - `run.sh`: everything, through `bin/scriptc-sqlite.mjs`, with the summary in `build/summary.txt` (about 8 minutes here).
 - `tools/peakrss.c`: peak memory of a child process.
-- `env.sh`: puts clang on PATH (sources the workspace's `.fern/env.sh`).
 - `build/` and `node_modules/` are ignored by git.
 
 ## Next (not started)

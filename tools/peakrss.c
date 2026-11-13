@@ -1,6 +1,6 @@
 /* peakrss PROGRAM ARGS...: runs PROGRAM with its output passed through and
  * prints its peak resident memory (ru_maxrss) to stderr as "peak-rss-kib N".
- * The box has no /usr/bin/time; this is the same measurement. */
+ * The same measurement as /usr/bin/time, on Linux and macOS. */
 #include <stdio.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
@@ -21,7 +21,12 @@ int main(int argc, char **argv) {
   int status = 0;
   struct rusage usage;
   if (wait4(pid, &status, 0, &usage) < 0) return 2;
+#ifdef __APPLE__
+  /* macOS reports bytes, Linux KiB. */
+  fprintf(stderr, "peak-rss-kib %ld\n", usage.ru_maxrss / 1024);
+#else
   fprintf(stderr, "peak-rss-kib %ld\n", usage.ru_maxrss);
+#endif
   if (WIFEXITED(status)) return WEXITSTATUS(status);
   return 128 + (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
 }
