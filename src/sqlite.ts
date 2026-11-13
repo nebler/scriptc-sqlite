@@ -43,11 +43,12 @@ declare function sqxColumnName(stmt: bigint, index: number, out: Uint8Array): bi
 declare function sqxColumnOrigin(stmt: bigint, index: number, which: number, out: Uint8Array): bigint;
 declare function sqxColumnType(stmt: bigint, index: number): number;
 declare function sqxColumnInt64(stmt: bigint, index: number): bigint;
+declare function sqxColumnSafeInt(stmt: bigint, index: number): number;
 declare function sqxColumnDouble(stmt: bigint, index: number): number;
-declare function sqxColumnText(stmt: bigint, index: number, out: Uint8Array): bigint;
-declare function sqxColumnBlob(stmt: bigint, index: number, out: Uint8Array): bigint;
+declare function sqxColumnText(stmt: bigint, index: number, out: Uint8Array): number;
+declare function sqxColumnBlob(stmt: bigint, index: number, out: Uint8Array): number;
 declare function sqxVersion(out: Uint8Array): bigint;
-declare function sqxRow(stmt: bigint, out: Uint8Array): bigint;
+declare function sqxRow(stmt: bigint, out: Uint8Array): number;
 declare function sqxColumnsMode(): number;
 declare function sqxGetenv(name: string, out: Uint8Array): bigint;
 declare function sqxSerialize(db: bigint, schema: string): bigint;
@@ -62,7 +63,7 @@ declare function sqxBackupRemaining(backup: bigint): number;
 declare function sqxBackupErrcode(backup: bigint): number;
 declare function sqxBackupErrmsg(backup: bigint, out: Uint8Array): bigint;
 declare function sqxBackupFinish(backup: bigint): void;
-declare function sqxStepRow(stmt: bigint, out: Uint8Array): bigint;
+declare function sqxStepRow(stmt: bigint, out: Uint8Array): number;
 declare function sqxSetDispatch(fn: (op: number, id: number, argc: number) => number): void;
 declare function sqxCreateFunction(db: bigint, name: string, argc: number, flags: number, id: number): number;
 declare function sqxCreateAggregate(
@@ -81,8 +82,8 @@ declare function sqxValueType(index: number): number;
 declare function sqxValueInt64(index: number): bigint;
 declare function sqxValueDouble(index: number): number;
 declare function sqxValueSafeInt(index: number): number;
-declare function sqxValueText(index: number, out: Uint8Array): bigint;
-declare function sqxValueBlob(index: number, out: Uint8Array): bigint;
+declare function sqxValueText(index: number, out: Uint8Array): number;
+declare function sqxValueBlob(index: number, out: Uint8Array): number;
 declare function sqxResultNull(): void;
 declare function sqxResultDouble(value: number): void;
 declare function sqxResultInt64(value: bigint): void;
@@ -276,37 +277,37 @@ function readBytes(fetch: (out: Uint8Array) => bigint): Uint8Array {
 // The same as readText/readBytes for the hottest reads, written out
 // without a callback: a closure per value is measurable in scriptc.
 function columnText(stmt: bigint, i: number): string {
-  let n = Number(sqxColumnText(stmt, i, scratch));
+  let n = sqxColumnText(stmt, i, scratch);
   if (n > scratch.length) {
     scratch = new Uint8Array(Math.max(n, scratch.length * 2));
-    n = Number(sqxColumnText(stmt, i, scratch));
+    n = sqxColumnText(stmt, i, scratch);
   }
   return n <= 0 ? "" : utf8(scratch.subarray(0, n));
 }
 
 function columnBlob(stmt: bigint, i: number): Uint8Array {
-  let n = Number(sqxColumnBlob(stmt, i, scratch));
+  let n = sqxColumnBlob(stmt, i, scratch);
   if (n > scratch.length) {
     scratch = new Uint8Array(Math.max(n, scratch.length * 2));
-    n = Number(sqxColumnBlob(stmt, i, scratch));
+    n = sqxColumnBlob(stmt, i, scratch);
   }
   return n <= 0 ? new Uint8Array(0) : scratch.slice(0, n);
 }
 
 function valueText(i: number): string {
-  let n = Number(sqxValueText(i, scratch));
+  let n = sqxValueText(i, scratch);
   if (n > scratch.length) {
     scratch = new Uint8Array(Math.max(n, scratch.length * 2));
-    n = Number(sqxValueText(i, scratch));
+    n = sqxValueText(i, scratch);
   }
   return n <= 0 ? "" : utf8(scratch.subarray(0, n));
 }
 
 function valueBlob(i: number): Uint8Array {
-  let n = Number(sqxValueBlob(i, scratch));
+  let n = sqxValueBlob(i, scratch);
   if (n > scratch.length) {
     scratch = new Uint8Array(Math.max(n, scratch.length * 2));
-    n = Number(sqxValueBlob(i, scratch));
+    n = sqxValueBlob(i, scratch);
   }
   return n <= 0 ? new Uint8Array(0) : scratch.slice(0, n);
 }
@@ -393,6 +394,8 @@ function stepError(db: bigint, rc: number): unknown {
 /** Forget an exception left by a callback whose failure SQLite ignored
  * (an aggregate finalized while a statement was reset). */
 function clearCallbackError(): void {
+  // Only when set: this runs once per row, and writing an unknown is not free.
+  if (!callbackFailed) return;
   callbackFailed = false;
   callbackError = undefined;
 }
@@ -897,6 +900,12 @@ export class DatabaseSync {
     return this.#db;
   }
 
+  /** @internal Throws as _handleFor does, without returning the handle
+   * (a bigint): statements check this once per row. */
+  _checkGeneration(generation: number): void {
+    if (generation !== this.#generation || this.#db === NULL_HANDLE) throw finalizedError();
+  }
+
   /** @internal Borrow a compiled statement for `sql`. */
   _acquire(sql: string): bigint {
     const db = this.#handle();
@@ -1107,7 +1116,7 @@ export class StatementSync {
 
   #check(): void {
     if (this.#closed) throw finalizedError();
-    this.#db._handleFor(this.#generation);
+    this.#db._checkGeneration(this.#generation);
   }
 
   #start(params: unknown[]): bigint {
@@ -1213,7 +1222,7 @@ export class StatementSync {
     // Keep the buffer this call used: a user function that runs a query
     // during the step may replace rowBuffer meanwhile.
     let buffer = rowBuffer;
-    let n = Number(sqxStepRow(stmt, buffer));
+    let n = sqxStepRow(stmt, buffer);
     if (n < 0) {
       const rc = -1 - n;
       if (rc !== SQLITE_DONE) throw stepError(this.#db._handle(), rc);
@@ -1223,7 +1232,7 @@ export class StatementSync {
       buffer = new Uint8Array(Math.max(n, buffer.length * 2));
       rowBuffer = buffer;
       rowView = new DataView(buffer.buffer);
-      n = Number(sqxRow(stmt, buffer));
+      n = sqxRow(stmt, buffer);
     }
     if (names.length === 0) for (const name of this.#columnNames(stmt)) names.push(name);
     return this.#unpack(buffer, buffer === rowBuffer ? rowView : new DataView(buffer.buffer), names);
@@ -1275,14 +1284,16 @@ export class StatementSync {
   #value(stmt: bigint, i: number): SQLOutputValue {
     const type = sqxColumnType(stmt, i);
     if (type === SQLITE_INTEGER) {
-      const value = sqxColumnInt64(stmt, i);
-      if (this.#settings.readBigInts) return value;
+      if (this.#settings.readBigInts) return sqxColumnInt64(stmt, i);
       // Node refuses values outside the safe range in both directions.
       // (Node on Linux returns -2^63 itself rounded instead of refusing it,
       // while Node on macOS refuses it; this module refuses it everywhere.)
-      if (value > MAX_SAFE || value < -MAX_SAFE)
-        throw new SQLiteError(`Value is too large to be represented as a JavaScript number: ${value}`, "ERR_OUT_OF_RANGE");
-      return Number(value);
+      const value = sqxColumnSafeInt(stmt, i);
+      if (value !== value) {
+        const big = sqxColumnInt64(stmt, i);
+        throw new SQLiteError(`Value is too large to be represented as a JavaScript number: ${big}`, "ERR_OUT_OF_RANGE");
+      }
+      return value;
     }
     if (type === SQLITE_FLOAT) return sqxColumnDouble(stmt, i);
     if (type === SQLITE_TEXT) return columnText(stmt, i);

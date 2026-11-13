@@ -50,7 +50,13 @@ void *sqx_open(const uint8_t *path, size_t path_len, int32_t read_only, int32_t 
   name[path_len] = 0;
   sqlite3 *db = NULL;
   int flags = read_only ? SQLITE_OPEN_READONLY : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
-  int rc = sqlite3_open_v2(name, &db, flags | SQLITE_OPEN_URI, NULL);
+  /* NOMUTEX: a connection never leaves the thread that opened it (a
+   * scriptc worker shares no memory, and DatabaseSync cannot be posted),
+   * so SQLite's per-connection mutex, taken on every step and column
+   * read in the default serialized mode, only costs time: about a third
+   * of a plain C scan. Different connections stay safe on different
+   * threads (SQLite's multi-thread mode). */
+  int rc = sqlite3_open_v2(name, &db, flags | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX, NULL);
   if (rc == SQLITE_OK && db) {
     sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_FKEY, foreign_keys ? 1 : 0, (int *)NULL);
     sqlite3_db_config(db, SQLITE_DBCONFIG_DQS_DML, dqs ? 1 : 0, (int *)NULL);
@@ -211,19 +217,27 @@ int32_t sqx_column_type(void *stmt, int32_t i) { return sqlite3_column_type((sql
 
 int64_t sqx_column_int64(void *stmt, int32_t i) { return sqlite3_column_int64((sqlite3_stmt *)stmt, i); }
 
+/* An integer column as a double within ±(2^53 - 1), NaN outside (as
+ * sqx_value_safe_int): no bigint to allocate per value. */
+double sqx_column_safe_int(void *stmt, int32_t i) {
+  int64_t v = sqlite3_column_int64((sqlite3_stmt *)stmt, i);
+  const int64_t max = 9007199254740991LL;
+  return v > max || v < -max ? NAN : (double)v;
+}
+
 double sqx_column_double(void *stmt, int32_t i) { return sqlite3_column_double((sqlite3_stmt *)stmt, i); }
 
 /* Text and blob values: the full length is returned, at most `cap` bytes are
  * copied. The value stays valid until the next step, reset or finalize, so
  * a second call with a bigger buffer sees the same bytes. Text is read as
  * UTF-8 first, then measured, as SQLite's documentation requires. */
-int64_t sqx_column_text(void *stmt, int32_t i, uint8_t *out, size_t cap) {
+double sqx_column_text(void *stmt, int32_t i, uint8_t *out, size_t cap) {
   const unsigned char *t = sqlite3_column_text((sqlite3_stmt *)stmt, i);
   size_t n = (size_t)sqlite3_column_bytes((sqlite3_stmt *)stmt, i);
   return t ? copy_out(t, n, out, cap) : 0;
 }
 
-int64_t sqx_column_blob(void *stmt, int32_t i, uint8_t *out, size_t cap) {
+double sqx_column_blob(void *stmt, int32_t i, uint8_t *out, size_t cap) {
   const void *b = sqlite3_column_blob((sqlite3_stmt *)stmt, i);
   size_t n = (size_t)sqlite3_column_bytes((sqlite3_stmt *)stmt, i);
   return b ? copy_out(b, n, out, cap) : 0;
@@ -299,7 +313,8 @@ void *sqx_backup_open(void *src, const uint8_t *path, size_t path_len, const uin
   b->backup = NULL;
   char *file = span_dup(path, path_len), *from = span_dup(src_name, src_len), *to = span_dup(dest_name, dest_len);
   if (file && from && to) {
-    if (sqlite3_open_v2(file, &b->dest, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) ==
+    if (sqlite3_open_v2(file, &b->dest, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX,
+                        NULL) ==
         SQLITE_OK)
       b->backup = sqlite3_backup_init(b->dest, to, (sqlite3 *)src, from);
   }
@@ -349,7 +364,7 @@ static void put64(uint8_t *p, uint64_t v) {
   for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
 }
 
-int64_t sqx_row(void *stmt, uint8_t *out, size_t cap) {
+double sqx_row(void *stmt, uint8_t *out, size_t cap) {
   sqlite3_stmt *s = (sqlite3_stmt *)stmt;
   int count = sqlite3_column_count(s);
   size_t need = 0;
@@ -362,7 +377,7 @@ int64_t sqx_row(void *stmt, uint8_t *out, size_t cap) {
     } else if (type == SQLITE_BLOB) need += 5 + (size_t)sqlite3_column_bytes(s, i);
     else need += 1;
   }
-  if (need > cap) return (int64_t)need;
+  if (need > cap) return (double)need;
   uint8_t *p = out;
   for (int i = 0; i < count; i++) {
     int type = sqlite3_column_type(s, i);
@@ -385,7 +400,7 @@ int64_t sqx_row(void *stmt, uint8_t *out, size_t cap) {
       p += n;
     }
   }
-  return (int64_t)need;
+  return (double)need;
 }
 
 /* An environment variable's value (copied as usual), or -1 when unset. */
@@ -407,9 +422,9 @@ int32_t sqx_columns_mode(void) {
 
 /* Steps; on a row, packs it as sqx_row does and returns its length (>= 0).
  * Otherwise returns -1 - rc: -102 for SQLITE_DONE, -2 for SQLITE_ERROR. */
-int64_t sqx_step_row(void *stmt, uint8_t *out, size_t cap) {
+double sqx_step_row(void *stmt, uint8_t *out, size_t cap) {
   int rc = sqlite3_step((sqlite3_stmt *)stmt);
-  if (rc != SQLITE_ROW) return -1 - (int64_t)rc;
+  if (rc != SQLITE_ROW) return -1.0 - rc;
   return sqx_row(stmt, out, cap);
 }
 
@@ -540,13 +555,13 @@ double sqx_value_safe_int(int32_t i) {
   return v > max || v < -max ? NAN : (double)v;
 }
 
-int64_t sqx_value_text(int32_t i, uint8_t *out, size_t cap) {
+double sqx_value_text(int32_t i, uint8_t *out, size_t cap) {
   const unsigned char *t = sqlite3_value_text(arg(i));
   size_t n = (size_t)sqlite3_value_bytes(arg(i));
   return t ? copy_out(t, n, out, cap) : 0;
 }
 
-int64_t sqx_value_blob(int32_t i, uint8_t *out, size_t cap) {
+double sqx_value_blob(int32_t i, uint8_t *out, size_t cap) {
   const void *b = sqlite3_value_blob(arg(i));
   size_t n = (size_t)sqlite3_value_bytes(arg(i));
   return b ? copy_out(b, n, out, cap) : 0;
