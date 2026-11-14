@@ -9,6 +9,14 @@
     ".": {
       "types": "./src/sqlite.ts",
       "default": "./src/sqlite.ts"
+    },
+    "./query": {
+      "types": "./src/query.ts",
+      "default": "./src/query.ts"
+    },
+    "./migrate": {
+      "types": "./src/migrate.ts",
+      "default": "./src/migrate.ts"
     }
   },
   "bin": {
@@ -18,6 +26,8 @@
     "bin/",
     "native/",
     "src/sqlite.ts",
+    "src/query.ts",
+    "src/migrate.ts",
     "build.sh",
     "ffi.json"
   ],

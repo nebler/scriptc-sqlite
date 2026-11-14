@@ -1,0 +1,120 @@
+name: Benchmark
+
+# Runs on pull requests that change what affects speed (5 timed runs, and
+# the tables go into one PR comment that later pushes update), or by hand
+# from the Actions tab (15 runs by default). Shared CI runners are noisy:
+# compare implementations within one run, not across runs (bench/README.md).
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "native/**"
+      - "build.sh"
+      - "ffi.json"
+      - "bin/**"
+      - "bench/**"
+      - "package-lock.json"
+      - ".github/workflows/bench.yml"
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: Timed runs per implementation and workload (after 2 warm-ups)
+        default: "15"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: bench (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.8
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.14
+          cache-dependency-path: bench/go/go.sum
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.91.1
+      - name: Cache Goose compiler
+        id: goose-cache
+        uses: actions/cache@v4
+        with:
+          path: build/bench/goose-toolchain
+          key: goose-${{ runner.os }}-${{ runner.arch }}-4602c98660676b2cb94bc9b06fec8c65b37fce92-v1
+      - name: Build Goose compiler
+        if: steps.goose-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/aardappel/goose.git build/bench/goose-toolchain/src
+          git -C build/bench/goose-toolchain/src checkout --detach 4602c98660676b2cb94bc9b06fec8c65b37fce92
+          git -C build/bench/goose-toolchain/src submodule update --init --recursive
+          cmake -S build/bench/goose-toolchain/src -B build/bench/goose-toolchain/compiler -DCMAKE_BUILD_TYPE=Release -DGOOSE_BUILTIN_LIBS=none
+          cmake --build build/bench/goose-toolchain/compiler --parallel 3
+      - name: Add Goose to PATH
+        run: echo "$GITHUB_WORKSPACE/build/bench/goose-toolchain/compiler" >> "$GITHUB_PATH"
+      - name: Install scriptc
+        run: npm ci --no-audit --no-fund
+      - name: Check that every implementation agrees
+        run: node bench/run.mjs --check
+      - name: Benchmark
+        run: node bench/run.mjs --runs=${{ inputs.runs || (github.event_name == 'pull_request' && '5') || '15' }}
+      - name: Summary
+        if: always()
+        run: cat bench/results/*.md >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.os }}
+          path: bench/results/
+          if-no-files-found: ignore
+
+  # One comment on the pull request with every machine's tables, updated in
+  # place on later pushes. Skipped for pull requests from forks, whose token
+  # can't write comments.
+  comment:
+    name: comment on the pull request
+    needs: bench
+    if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bench-*
+          path: results
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+            const marker = "<!-- scriptc-sqlite benchmark -->";
+            let body = `${marker}\n## Benchmark results\n\nCommit ${context.payload.pull_request.head.sha.slice(0, 7)}, 5 timed runs each. Shared runners are noisy: compare rows within one table, not across runs. [Full run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})\n`;
+            const dirs = fs.existsSync("results") ? fs.readdirSync("results").sort() : [];
+            for (const dir of dirs)
+              for (const file of fs.readdirSync(path.join("results", dir)).filter((f) => f.endsWith(".md")))
+                body += `\n<details open><summary>${file.replace(/\.md$/, "")}</summary>\n\n${fs.readFileSync(path.join("results", dir, file), "utf8")}\n</details>\n`;
+            if (dirs.length === 0) body += "\nNo results: the benchmark jobs failed. See the run.\n";
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const old = comments.find((c) => c.body && c.body.startsWith(marker));
+            if (old) await github.rest.issues.updateComment({ owner, repo, comment_id: old.id, body });
+            else await github.rest.issues.createComment({ owner, repo, issue_number, body });
