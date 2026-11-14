@@ -1,0 +1,7 @@
+warning SC6101: 1 function that likely runs often uses untyped values, which runs slower than typed code:
+  anonymous function (server.ts:157): `c` is `any`, in a loop
+  untyped code in npm packages: hono (250 functions)
+  hint: add types to compile these statically; see scriptc coverage --explain-dynamic
+
+The program compiled. Adding types to these functions lets scriptc compile them to faster code.
+/Users/noah/code/scriptc-wt/sqlite-pr1/demo/server/build/links
