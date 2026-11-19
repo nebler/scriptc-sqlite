@@ -1,0 +1,16 @@
+{
+  "name": "my-sqlite-app",
+  "private": true,
+  "type": "module",
+  "description": "A scriptc program with SQLite inside, from the scriptc-sqlite starter",
+  "scripts": {
+    "setup": "node setup.mjs",
+    "build": "scriptc-sqlite build src/main.ts -o build/app"
+  },
+  "dependencies": {
+    "scriptc-sqlite": "file:vendor/scriptc-sqlite"
+  },
+  "devDependencies": {
+    "scriptc": "0.4.12"
+  }
+}

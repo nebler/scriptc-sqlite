@@ -1,0 +1,8 @@
+// Same amalgamation as build.sh, separately compiled by Goose's C backend.
+c_sources = ["adapter.c", "../../build/dl/sqlite-amalgamation-3540100/sqlite3.c"];
+c_include = ["../../build/dl/sqlite-amalgamation-3540100"];
+// SQLite's speed-relevant options as build.sh compiles them for scriptc, so
+// both run the same SQLite (the adapter also opens without the mutex).
+c_defines = ["SQLITE_THREADSAFE=1", "SQLITE_DEFAULT_MEMSTATUS=0", "SQLITE_DQS=0", "SQLITE_OMIT_DEPRECATED",
+             "SQLITE_OMIT_SHARED_CACHE", "SQLITE_OMIT_LOAD_EXTENSION", "SQLITE_LIKE_DOESNT_MATCH_BLOBS"];
+c_libs_linux = ["m", "dl", "pthread"];

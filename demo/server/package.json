@@ -1,0 +1,15 @@
+{
+  "name": "scriptc-sqlite-links",
+  "private": true,
+  "type": "module",
+  "description": "A web backend in one native binary: Hono + scriptc-sqlite, compiled by scriptc",
+  "scripts": {
+    "build": "scriptc-sqlite build server.ts -o build/links",
+    "start": "./build/links"
+  },
+  "dependencies": {
+    "@hono/node-server": "2.1.8",
+    "hono": "4.13.18",
+    "scriptc-sqlite": "file:../.."
+  }
+}

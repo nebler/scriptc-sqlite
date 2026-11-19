@@ -1,0 +1,137 @@
+$ marks add https://sqlite.org/fts5.html SQLite FTS5 Extension --tag sqlite --tag search
+saved 1
+(exit 0)
+$ marks add https://www.sqlite.org/lang_upsert.html UPSERT in SQLite --tag sqlite
+saved 2
+(exit 0)
+$ marks add https://scriptc.dev/docs/ffi scriptc: calling C libraries --tag scriptc --tag Docs
+saved 3
+(exit 0)
+$ marks add https://nodejs.org/api/sqlite.html node:sqlite — Node.js docs --tag docs
+saved 4
+(exit 0)
+$ marks add https://example.com Ünïcödé 🙂 test page
+saved 5
+(exit 0)
+$ marks add https://scriptc.dev/docs/ffi scriptc FFI: calling C from TypeScript --tag ffi
+saved 3
+(exit 0)
+$ marks list
+  1  SQLite FTS5 Extension  [search, sqlite]
+     https://sqlite.org/fts5.html
+  2  UPSERT in SQLite  [sqlite]
+     https://www.sqlite.org/lang_upsert.html
+  3  scriptc FFI: calling C from TypeScript  [docs, ffi, scriptc]
+     https://scriptc.dev/docs/ffi
+  4  node:sqlite — Node.js docs  [docs]
+     https://nodejs.org/api/sqlite.html
+  5  Ünïcödé 🙂 test page
+     https://example.com
+(exit 0)
+$ marks list --tag docs
+  3  scriptc FFI: calling C from TypeScript  [docs, ffi, scriptc]
+     https://scriptc.dev/docs/ffi
+  4  node:sqlite — Node.js docs  [docs]
+     https://nodejs.org/api/sqlite.html
+(exit 0)
+$ marks find sqlite
+  1  «SQLite» FTS5 Extension  [search, sqlite]
+     https://sqlite.org/fts5.html
+  2  UPSERT in «SQLite»  [sqlite]
+     https://www.sqlite.org/lang_upsert.html
+  4  node:«sqlite» — Node.js docs  [docs]
+     https://nodejs.org/api/sqlite.html
+(exit 0)
+$ marks find calling c
+  3  scriptc FFI: «calling C» from TypeScript  [docs, ffi, scriptc]
+     https://scriptc.dev/docs/ffi
+(exit 0)
+$ marks find 🙂
+  5  Ünïcödé «🙂» test page
+     https://example.com
+(exit 0)
+$ marks find nothing-like-this
+nothing found
+(exit 0)
+$ marks tags
+  2  docs
+  2  sqlite
+  1  ffi
+  1  scriptc
+  1  search
+(exit 0)
+$ marks stats
+5 bookmarks on 4 sites, 4 tagged
+  2  sqlite.org
+  1  example.com
+  1  nodejs.org
+  1  scriptc.dev
+(exit 0)
+$ marks export
+[
+  {
+    "url": "https://sqlite.org/fts5.html",
+    "title": "SQLite FTS5 Extension",
+    "tags": [
+      "search",
+      "sqlite"
+    ]
+  },
+  {
+    "url": "https://www.sqlite.org/lang_upsert.html",
+    "title": "UPSERT in SQLite",
+    "tags": [
+      "sqlite"
+    ]
+  },
+  {
+    "url": "https://scriptc.dev/docs/ffi",
+    "title": "scriptc FFI: calling C from TypeScript",
+    "tags": [
+      "docs",
+      "ffi",
+      "scriptc"
+    ]
+  },
+  {
+    "url": "https://nodejs.org/api/sqlite.html",
+    "title": "node:sqlite — Node.js docs",
+    "tags": [
+      "docs"
+    ]
+  },
+  {
+    "url": "https://example.com",
+    "title": "Ünïcödé 🙂 test page",
+    "tags": []
+  }
+]
+(exit 0)
+$ marks rm 2
+deleted 2: UPSERT in SQLite
+(exit 0)
+$ marks rm 99
+no bookmark 99
+(exit 0)
+$ marks find upsert
+nothing found
+(exit 0)
+$ marks backup build/tmp/marks-session/copy.db
+backed up 4 bookmarks to build/tmp/marks-session/copy.db
+(exit 0)
+imported 5
+  1  SQLite FTS5 Extension  [search, sqlite]
+     https://sqlite.org/fts5.html
+  2  UPSERT in SQLite  [sqlite]
+     https://www.sqlite.org/lang_upsert.html
+5 bookmarks on 4 sites, 4 tagged
+  2  sqlite.org
+  1  example.com
+  1  nodejs.org
+  1  scriptc.dev
+$ marks add only-a-url
+marks: usage: marks add <url> <title…> [--tag <tag>]…
+(exit 1)
+$ marks nonsense
+usage: marks add | find | list | tags | rm | stats | export | import | backup  (see the top of marks.ts)
+(exit 0)
